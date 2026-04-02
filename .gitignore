@@ -1,0 +1,27 @@
+# Local data / caches
+data/
+data_ui/
+**/agent_cache.db
+
+# Build outputs / binaries
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test.exe
+
+# Logs
+log.txt
+
+# Generated / local TLS material (do not commit private keys)
+certs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+
