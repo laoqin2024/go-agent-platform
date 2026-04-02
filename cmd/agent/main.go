@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -63,7 +64,8 @@ func main() {
 	}()
 
 	engine := internalservice.NewSimCollector(logger, *collectEvery, cache)
-	if *debug {
+	runForeground := *debug || (runtime.GOOS == "windows" && kservice.Interactive())
+	if runForeground {
 		// In debug mode, retry hardware scan frequently so hardware_details shows up quickly
 		// even if the startup scan fails due to transient Windows/WMI/permission issues.
 		engine = internalservice.NewSimCollector(
@@ -90,9 +92,9 @@ func main() {
 	}
 
 	dispatcher := internalservice.NewDataDispatcher(logger, cache, httpClient)
-	// In debug mode, increase dispatch throughput so low-frequency inventory items
+	// In foreground mode, increase dispatch throughput so low-frequency inventory items
 	// (hardware_details/software_inventory) are not starved by high-frequency metrics.
-	if *debug {
+	if runForeground {
 		dispatcher = internalservice.NewDataDispatcher(
 			logger,
 			cache,
@@ -109,8 +111,8 @@ func main() {
 		internalservice.WithDispatcher(dispatcher),
 	)
 
-	if *debug {
-		logger.Info("debug mode: starting agent service (will stop on Ctrl+C)")
+	if runForeground {
+		logger.Info("foreground mode: starting agent service (will stop on Ctrl+C/window close)")
 		if err := wrapper.Start(nil); err != nil {
 			logger.Error("failed to start service", "err", err)
 			os.Exit(1)
@@ -120,12 +122,12 @@ func main() {
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 
-		logger.Info("debug mode: stop signal received")
+		logger.Info("foreground mode: stop signal received")
 		if err := wrapper.Stop(nil); err != nil {
 			logger.Error("failed to stop service", "err", err)
 			os.Exit(1)
 		}
-		logger.Info("debug mode: agent stopped cleanly")
+		logger.Info("foreground mode: agent stopped cleanly")
 		return
 	}
 

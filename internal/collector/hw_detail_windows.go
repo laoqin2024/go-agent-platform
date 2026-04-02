@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -154,6 +155,54 @@ func collectMainboard(ctx context.Context) (*MainboardInfo, error) {
 		Version:      version,
 		Serial:       serial,
 	}, nil
+}
+
+func collectPartitions(ctx context.Context) ([]PartitionInfo, error) {
+	// Use WMIC for broad compatibility (works on Win7+). Output is locale-independent in list format.
+	cmdCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cmdCtx, "wmic", "logicaldisk", "get", "DeviceID,FileSystem,Size,FreeSpace", "/format:list").CombinedOutput()
+	if err != nil {
+		return nil, nil // best-effort; don't fail inventory if WMIC not present
+	}
+	blocks := strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n\n")
+	var parts []PartitionInfo
+	for _, b := range blocks {
+		lines := strings.Split(b, "\n")
+		var id, fs string
+		var size, free uint64
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			if strings.HasPrefix(ln, "DeviceID=") {
+				id = strings.TrimPrefix(ln, "DeviceID=")
+			} else if strings.HasPrefix(ln, "FileSystem=") {
+				fs = strings.TrimPrefix(ln, "FileSystem=")
+			} else if strings.HasPrefix(ln, "Size=") {
+				if v, err := strconv.ParseUint(strings.TrimPrefix(ln, "Size="), 10, 64); err == nil {
+					size = v
+				}
+			} else if strings.HasPrefix(ln, "FreeSpace=") {
+				if v, err := strconv.ParseUint(strings.TrimPrefix(ln, "FreeSpace="), 10, 64); err == nil {
+					free = v
+				}
+			}
+		}
+		if id == "" {
+			continue
+		}
+		mp := id + `\`
+		parts = append(parts, PartitionInfo{
+			Name:       id,
+			Mountpoint: mp,
+			FSType:     fs,
+			SizeBytes:  size,
+			FreeBytes:  free,
+		})
+	}
+	return parts, nil
 }
 
 // --- Helpers ---
@@ -551,8 +600,9 @@ func parseSMBIOSMemoryDevices(table []byte) []RamInfo {
 			manu = smbiosString(s.strs, s.data[0x17])
 		}
 
-		// Skip empty entries
-		if sizeBytes == 0 && speed == 0 && manu == "" && memType == "" && slot == "" {
+		// Skip uninstalled/empty slots (common in VMs with large virtual slot tables).
+		// Keep only slots that actually report a non-zero capacity.
+		if sizeBytes == 0 {
 			return false
 		}
 		out = append(out, RamInfo{

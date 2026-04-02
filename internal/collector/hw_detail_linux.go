@@ -17,7 +17,7 @@ import (
 func collectPhysicalDisks(ctx context.Context) ([]DiskInfo, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cmdCtx, "lsblk", "-J", "-o", "NAME,MODEL,SERIAL,SIZE,ROTA,TYPE,TRAN").CombinedOutput()
+	out, err := exec.CommandContext(cmdCtx, "lsblk", "-b", "-J", "-o", "NAME,MODEL,SERIAL,SIZE,ROTA,TYPE,TRAN").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("lsblk failed: %w", err)
 	}
@@ -51,7 +51,7 @@ func collectPhysicalDisks(ctx context.Context) ([]DiskInfo, error) {
 		disks = append(disks, DiskInfo{
 			Model:     strings.TrimSpace(model),
 			Serial:    strings.TrimSpace(serial),
-			SizeBytes: parseUint(sizeStr),
+			SizeBytes: parseUintLinux(sizeStr),
 			BusType:   bus,
 			DriveType: driveType,
 		})
@@ -104,6 +104,55 @@ func collectGPUs(ctx context.Context) ([]GPUInfo, error) {
 	return []GPUInfo{}, nil
 }
 
+func collectPartitions(ctx context.Context) ([]PartitionInfo, error) {
+	cmdCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	// Use lsblk JSON for reliable mounts (no sudo needed)
+	out, err := exec.CommandContext(cmdCtx, "lsblk", "-b", "-J", "-o", "NAME,MOUNTPOINT,FSTYPE,SIZE,TYPE").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("lsblk for partitions failed: %w", err)
+	}
+	var root struct {
+		Blockdevices []map[string]any `json:"blockdevices"`
+	}
+	if err := json.Unmarshal(out, &root); err != nil {
+		return nil, err
+	}
+	var parts []PartitionInfo
+	var walk func(items []map[string]any)
+	walk = func(items []map[string]any) {
+		for _, it := range items {
+			typ := strings.ToLower(fmt.Sprint(it["type"]))
+			if typ == "part" {
+				name := fmt.Sprint(it["name"])
+				mp := fmt.Sprint(it["mountpoint"])
+				fs := fmt.Sprint(it["fstype"])
+				size := parseUintLinux(fmt.Sprint(it["size"]))
+				parts = append(parts, PartitionInfo{
+					Name:       "/dev/" + strings.TrimSpace(name),
+					Mountpoint: strings.TrimSpace(mp),
+					FSType:     strings.TrimSpace(fs),
+					SizeBytes:  size,
+					FreeBytes:  0, // optional: could compute from 'df', but keep lightweight
+				})
+			}
+			if ch, ok := it["children"].([]any); ok && len(ch) > 0 {
+				var next []map[string]any
+				for _, v := range ch {
+					if m, ok := v.(map[string]any); ok {
+						next = append(next, m)
+					}
+				}
+				if len(next) > 0 {
+					walk(next)
+				}
+			}
+		}
+	}
+	walk(root.Blockdevices)
+	return parts, nil
+}
+
 func collectMainboard(ctx context.Context) (*MainboardInfo, error) {
 	read := func(p string) string {
 		b, err := os.ReadFile(filepath.Clean(p))
@@ -125,3 +174,14 @@ func collectMainboard(ctx context.Context) (*MainboardInfo, error) {
 	}, nil
 }
 
+func parseUintLinux(s string) uint64 {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}

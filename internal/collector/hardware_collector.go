@@ -30,6 +30,7 @@ type HardwareDetails struct {
 	GPUs          []GPUInfo      `json:"gpus,omitempty"`
 	Mainboard     *MainboardInfo `json:"mainboard,omitempty"`
 	NetworkIfaces []NetworkIfaceInfo `json:"network_ifaces,omitempty"`
+	Partitions    []PartitionInfo    `json:"partitions,omitempty"`
 	CollectedAt   time.Time      `json:"collected_at"`
 }
 
@@ -40,6 +41,15 @@ type DiskInfo struct {
 	SizeBytes uint64 `json:"size_bytes,omitempty"`
 	BusType   string `json:"bus_type,omitempty"`   // NVMe/SATA/USB/PCIe...
 	DriveType string `json:"drive_type,omitempty"` // SSD/HDD/Unknown
+}
+
+// PartitionInfo describes a logical volume/partition/mount.
+type PartitionInfo struct {
+	Name       string `json:"name,omitempty"`       // e.g. C:, /dev/sda1, disk3s1
+	Mountpoint string `json:"mountpoint,omitempty"` // e.g. C:\, /, /Volumes/Macintosh HD
+	FSType     string `json:"fs_type,omitempty"`    // ntfs, ext4, apfs...
+	SizeBytes  uint64 `json:"size_bytes,omitempty"`
+	FreeBytes  uint64 `json:"free_bytes,omitempty"`
 }
 
 // RamInfo describes a memory dimm/slot.
@@ -219,6 +229,11 @@ func (h *HardwareCollector) CollectWithContext(ctx context.Context) (HardwareDet
 		out.NetworkIfaces = ifaces
 	} else if h.logger != nil {
 		h.logger.Debug("hardware: collectNetworkIfaces failed", "err", err)
+	}
+	if parts, err := collectPartitions(ctx); err == nil {
+		out.Partitions = parts
+	} else if h.logger != nil {
+		h.logger.Debug("hardware: collectPartitions failed", "err", err)
 	}
 
 	h.mu.Lock()

@@ -225,7 +225,17 @@ func (c *SimCollector) triggerSoftwareScan(ctx context.Context, reason string) {
 			return
 		}
 		if c.buffer != nil {
-			payload, err := json.Marshal(apps)
+			// Wrap with fingerprint so backend can always attribute this batch item to a device,
+			// even when DataDispatcher sends only software_inventory in a batch.
+			fp := ""
+			if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+				fp = hw.Fingerprint
+			}
+			type softwareInventoryPayload struct {
+				Fingerprint string                 `json:"fingerprint,omitempty"`
+				Items       []collector.SoftwareInfo `json:"items"`
+			}
+			payload, err := json.Marshal(softwareInventoryPayload{Fingerprint: fp, Items: apps})
 			if err != nil {
 				c.logger.Warn("collection engine: failed to marshal software inventory", "err", err)
 				return
