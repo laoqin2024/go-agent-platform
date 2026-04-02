@@ -1,0 +1,73 @@
+version: 2
+
+project_name: go-agent
+
+builds:
+  - id: agent-windows
+    main: ./cmd/agent
+    binary: agent
+    goos: windows
+    goarch: amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/qinyilin/go-agent/cmd/agent.Version={{ .Version }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.BuildTime={{ .Date }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.GitCommit={{ .Commit }}
+
+  - id: agent-linux
+    main: ./cmd/agent
+    binary: agent
+    goos: linux
+    goarch: amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/qinyilin/go-agent/cmd/agent.Version={{ .Version }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.BuildTime={{ .Date }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.GitCommit={{ .Commit }}
+
+  - id: agent-darwin
+    main: ./cmd/agent
+    binary: agent
+    goos: darwin
+    goarch: arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/qinyilin/go-agent/cmd/agent.Version={{ .Version }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.BuildTime={{ .Date }}
+      - -X github.com/qinyilin/go-agent/cmd/agent.GitCommit={{ .Commit }}
+
+# Linux packages: generate .deb and .rpm
+nfpms:
+  - id: linux-packages
+    builds:
+      - agent-linux
+    package_name: go-agent
+    vendor: qinyilin
+    homepage: https://example.invalid
+    maintainer: qinyilin
+    description: Cross-platform IT device data collection agent
+    license: MIT
+    section: default
+    priority: optional
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+# Windows installer: generate .msi (requires Goreleaser installer provider support in your environment)
+installers:
+  - id: windows-msi
+    builds:
+      - agent-windows
+    name_template: "{{ .ProjectName }}-{{ .Version }}"
+    # Note: MSI packaging relies on the corresponding installer provider in your Goreleaser setup.
+    # If your local setup doesn't support MSI, you can swap this to a supported Windows installer provider.
+    provider: msi
+    file_name_template: "{{ .ProjectName }}-{{ .Version }}.msi"
+

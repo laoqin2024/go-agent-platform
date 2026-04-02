@@ -1,0 +1,1279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Go Agent 生产环境调试看板</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 min-h-screen">
+    <div id="app" class="max-w-6xl mx-auto py-6 px-4">
+      <header class="mb-6">
+        <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+          <div>
+            <h1 class="text-2xl font-bold text-cyan-300">
+              Go Agent 生产环境调试看板
+            </h1>
+            <p class="text-sm text-slate-400 mt-1">
+              通过 WebSocket 实时查看多终端数据（host_metrics / hardware_details / software_inventory / process_snapshot / network_connections）
+            </p>
+          </div>
+          <div class="flex items-center gap-3">
+            <div class="text-xs text-slate-400">
+              在线设备：<span class="text-cyan-300 font-medium">{{ onlineDevices.length }}</span>
+            </div>
+            <div class="flex items-center gap-2 text-lg">
+              <span v-for="d in osSummary" :key="d.os" :title="d.os" class="inline-flex items-center gap-1 text-slate-300">
+                <span>{{ osIcon(d.os) }}</span><span class="text-xs text-slate-400">{{ d.count }}</span>
+              </span>
+            </div>
+            <select v-model="selectedDevice" @change="onUserSelectDevice" class="bg-slate-900 border border-slate-700 text-sm rounded px-2 py-1 outline-none focus:ring-2 focus:ring-cyan-500">
+              <option v-for="dev in deviceOptions" :key="dev.fp" :value="dev.fp">
+                {{ dev.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+      </header>
+
+      <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <!-- 设备概览 -->
+        <div class="bg-slate-900/70 rounded-lg p-4 border border-slate-800">
+          <h2 class="text-lg font-semibold mb-3">设备概览</h2>
+          <div v-if="parsedHost">
+            <div class="mb-2">
+              <span class="text-slate-400">主机名：</span>
+              <span class="font-mono">{{ parsedHost.hostname || '未知' }}</span>
+            </div>
+            <div class="mb-2">
+              <span class="text-slate-400">硬件指纹：</span>
+              <span class="font-mono">{{ parsedHost.fingerprint || '未上报' }}</span>
+            </div>
+            <div class="mb-2">
+              <span class="text-slate-400">采集时间：</span>
+              <span class="font-mono">{{ parsedHost.CollectedAt || parsedHost.collectedAt || '未知' }}</span>
+            </div>
+          </div>
+          <div v-else class="text-slate-500 text-sm">
+            等待 Agent 上报 host_metrics...
+          </div>
+        </div>
+
+        <!-- 实时指标 -->
+        <div class="bg-slate-900/70 rounded-lg p-4 border border-slate-800 col-span-1 lg:col-span-2">
+          <h2 class="text-lg font-semibold mb-3">实时指标</h2>
+          <div v-if="parsedHost">
+            <div class="mb-3">
+              <div class="flex justify-between text-sm mb-1">
+                <span>CPU 占用率</span>
+                <span class="font-mono">{{ (parsedHost.CPU?.Total ?? parsedHost.cpu_total_percent ?? 0).toFixed(1) }}%</span>
+              </div>
+              <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  class="h-full bg-emerald-400"
+                  :style="{ width: ((parsedHost.CPU?.Total ?? parsedHost.cpu_total_percent ?? 0) + '%') }"
+                ></div>
+              </div>
+            </div>
+
+            <div class="mb-3">
+              <div class="flex justify-between text-sm mb-1">
+                <span>内存使用率</span>
+                <span class="font-mono">{{ (parsedHost.Memory?.UsedPercent ?? parsedHost.memory_used_percent ?? 0).toFixed(1) }}%</span>
+              </div>
+              <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  class="h-full bg-sky-400"
+                  :style="{ width: ((parsedHost.Memory?.UsedPercent ?? parsedHost.memory_used_percent ?? 0) + '%') }"
+                ></div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 text-xs text-slate-300 mt-4">
+              <div>
+                <div class="text-slate-400 mb-1">总内存</div>
+                <div class="font-mono">{{ formatBytes(parsedHost.Memory?.Total ?? parsedHost.memory_total_bytes) }}</div>
+              </div>
+              <div>
+                <div class="text-slate-400 mb-1">已用内存</div>
+                <div class="font-mono">{{ formatBytes(parsedHost.Memory?.Used ?? parsedHost.memory_used_bytes) }}</div>
+              </div>
+              <div>
+                <div class="text-slate-400 mb-1">磁盘使用率</div>
+                <div class="font-mono">
+                  {{ (parsedHost.Disk?.UsedPercent ?? parsedHost.disk_used_percent ?? 0).toFixed(1) }}%
+                </div>
+              </div>
+              <div>
+                <div class="text-slate-400 mb-1">网络累计收发</div>
+                <div class="font-mono">
+                  ↑ {{ formatBytes(parsedHost.Network?.BytesSent ?? parsedHost.network_bytes_sent) }} /
+                  ↓ {{ formatBytes(parsedHost.Network?.BytesRecv ?? parsedHost.network_bytes_recv) }}
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="text-slate-500 text-sm">
+            等待 Agent 上报 host_metrics...
+          </div>
+        </div>
+      </section>
+
+      <!-- 硬件详情 -->
+      <section class="bg-slate-900/70 rounded-lg p-4 border border-slate-800 mb-6">
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="text-lg font-semibold">硬件详情</h2>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-slate-500">hardware_details</span>
+            <button
+              type="button"
+              class="text-xs px-2 py-1 rounded border border-slate-700 hover:border-cyan-500"
+              @click="showHwDetail = !showHwDetail"
+            >
+              {{ showHwDetail ? '收起详细清单' : '展开详细清单' }}
+            </button>
+          </div>
+        </div>
+        <div v-if="parsedHardware" class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+          <div>
+            <div class="text-slate-400 mb-1">主机名</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.hostname || '未知' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">系统运行时间</div>
+            <div class="font-mono text-slate-100">{{ formatUptime(parsedHardware.uptime_seconds) }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">硬件指纹 (SMBIOS UUID)</div>
+            <div class="font-mono text-slate-100 break-all">{{ parsedHardware.fingerprint || '未上报' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">操作系统</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.os || '未知' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">内核版本</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.kernel_version || '未知' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">内核架构</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.kernel_arch || '未知' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">CPU 型号</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.cpu_model || '未知' }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">核心数</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.core_count || 0 }}</div>
+          </div>
+          <div>
+            <div class="text-slate-400 mb-1">采集时间</div>
+            <div class="font-mono text-slate-100">{{ parsedHardware.collected_at || '未知' }}</div>
+          </div>
+        </div>
+        <!-- 详细清单（可折叠） -->
+        <div v-if="parsedHardware && showHwDetail" class="mt-4 space-y-4">
+          <!-- 物理磁盘 -->
+          <div>
+            <div class="flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-slate-200">物理磁盘</h3>
+              <span class="text-xs text-slate-500">共 {{ (parsedHardware.physical_disks || []).length }} 块</span>
+            </div>
+            <div v-if="(parsedHardware.physical_disks || []).length" class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+              <div v-for="(d, i) in parsedHardware.physical_disks" :key="i" class="border border-slate-800 rounded p-3">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="text-xs px-2 py-0.5 rounded-full"
+                        :class="(d.drive_type || '').toUpperCase() === 'SSD' ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-700' : 'bg-slate-700/40 text-slate-200 border border-slate-700'">
+                    {{ (d.drive_type || 'Unknown').toUpperCase() }}
+                  </span>
+                  <span class="text-xs px-2 py-0.5 rounded-full bg-sky-700/30 text-sky-300 border border-sky-700">
+                    {{ d.bus_type || 'Unknown' }}
+                  </span>
+                </div>
+                <div class="text-slate-300 text-sm break-all">
+                  <div class="mb-1"><span class="text-slate-400">型号：</span><span class="font-mono">
+                    <template v-if="(d.drive_type || '').toUpperCase() === 'SSD'">⚡</template>
+                    <template v-if="(d.bus_type || '').toUpperCase() === 'NVME'">🚀</template>
+                    {{ d.model || '未知' }}</span></div>
+                  <div class="mb-1"><span class="text-slate-400">序列号：</span><span class="font-mono">{{ d.serial || '未知' }}</span></div>
+                  <div class=""><span class="text-slate-400">容量：</span><span class="font-mono">{{ formatBytes(d.size_bytes) }}</span></div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="text-xs text-slate-500 mt-1">暂无磁盘数据</div>
+          </div>
+
+          <!-- 显卡 -->
+          <div>
+            <h3 class="text-sm font-semibold text-slate-200">显卡</h3>
+            <div v-if="(parsedHardware.gpus || []).length" class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+              <div v-for="(g, i) in parsedHardware.gpus" :key="i" class="border border-slate-800 rounded p-3">
+                <div class="text-slate-300 text-sm">
+                  <div class="mb-1"><span class="text-slate-400">型号：</span><span class="font-mono">{{ displayOr(g.model, 'Apple M系列集成显卡') }}</span></div>
+                  <div class=""><span class="text-slate-400">显存：</span>
+                    <span class="font-mono">
+                      <template v-if="(g.vram_mb || 0) > 0">{{ (g.vram_mb / 1024).toFixed(1) }} GB</template>
+                      <template v-else>统一内存 (Unified Memory)</template>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="text-xs text-slate-500 mt-1">暂无显卡数据</div>
+          </div>
+
+          <!-- 内存插槽 -->
+          <div>
+            <h3 class="text-sm font-semibold text-slate-200">内存插槽</h3>
+            <div v-if="(parsedHardware.memory_slots || []).length" class="mt-2 overflow-x-auto">
+              <table class="min-w-full text-xs">
+                <thead class="bg-slate-800 text-slate-300">
+                  <tr>
+                    <th class="px-3 py-2 text-left">插槽</th>
+                    <th class="px-3 py-2 text-left">容量</th>
+                    <th class="px-3 py-2 text-left">频率</th>
+                    <th class="px-3 py-2 text-left">制造商</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(r, i) in parsedHardware.memory_slots" :key="i" class="border-t border-slate-800">
+                    <td class="px-3 py-2 font-mono">{{ displayOr(r.slot, '读取中...') }}</td>
+                    <td class="px-3 py-2 font-mono">{{ formatBytes(r.size_bytes) }}</td>
+                    <td class="px-3 py-2 font-mono">{{ r.speed_mhz ? r.speed_mhz + ' MHz' : '读取中...' }}</td>
+                    <td class="px-3 py-2 font-mono">{{ displayOr(r.manufacturer, '读取中...') }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else class="text-xs text-slate-500 mt-1">暂无内存插槽数据</div>
+          </div>
+
+          <!-- 主板 -->
+          <div>
+            <h3 class="text-sm font-semibold text-slate-200">主板</h3>
+            <div v-if="parsedHardware.mainboard" class="mt-2 text-sm text-slate-300">
+              <div class="mb-1"><span class="text-slate-400">制造商：</span><span class="font-mono">{{ parsedHardware.mainboard.manufacturer || '未知' }}</span></div>
+              <div class="mb-1"><span class="text-slate-400">型号：</span><span class="font-mono">{{ displayOr(parsedHardware.mainboard.model, '读取中...') }}</span></div>
+              <div class=""><span class="text-slate-400">版本：</span><span class="font-mono">{{ parsedHardware.mainboard.version || '未知' }}</span></div>
+            </div>
+            <div v-else class="text-xs text-slate-500 mt-1">暂无主板数据</div>
+          </div>
+
+          <!-- 网络接口 -->
+          <div>
+            <div class="flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-slate-200">网络接口</h3>
+              <span class="text-xs text-slate-500">展示 {{ filteredNetworkIfaces.length }} / {{ networkIfaceTotal }} 个</span>
+            </div>
+            <div class="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-300">
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="netRequireIP" class="accent-cyan-500" />
+                仅显示有 IP
+              </label>
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="netIncludeFilteredVirtual" class="accent-cyan-500" />
+                显示隧道/虚拟/容器网卡
+              </label>
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="netIncludeLoopback" class="accent-cyan-500" />
+                显示 Loopback
+              </label>
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="netOnlyUp" class="accent-cyan-500" />
+                仅显示 UP
+              </label>
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="netShowExcluded" class="accent-cyan-500" />
+                显示被过滤列表
+              </label>
+              <span class="text-slate-500">被过滤 {{ excludedNetworkIfaces.length }} 个</span>
+            </div>
+            <div v-if="filteredNetworkIfaces.length" class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+              <div v-for="(n, i) in filteredNetworkIfaces" :key="i" class="border border-slate-800 rounded p-3">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="text-xs px-2 py-0.5 rounded-full border"
+                        :class="n.is_up ? 'bg-emerald-600/30 text-emerald-300 border-emerald-700' : 'bg-slate-700/40 text-slate-200 border-slate-700'">
+                    {{ n.is_up ? 'UP' : 'DOWN' }}
+                  </span>
+                  <span v-if="n.is_loopback" class="text-xs px-2 py-0.5 rounded-full bg-violet-700/30 text-violet-300 border border-violet-700">
+                    LOOPBACK
+                  </span>
+                </div>
+                <div class="text-slate-300 text-xs space-y-1">
+                  <div><span class="text-slate-400">名称：</span><span class="font-mono">{{ n.name || '未知' }}</span></div>
+                  <div><span class="text-slate-400">MAC：</span><span class="font-mono">{{ n.mac || '无' }}</span></div>
+                  <div><span class="text-slate-400">MTU：</span><span class="font-mono">{{ n.mtu || '-' }}</span></div>
+                  <div>
+                    <span class="text-slate-400">IPv4：</span>
+                    <span class="font-mono break-all">{{ (n.ipv4 || []).length ? n.ipv4.join(', ') : '-' }}</span>
+                  </div>
+                  <div>
+                    <span class="text-slate-400">IPv6：</span>
+                    <span class="font-mono break-all">{{ (n.ipv6 || []).length ? n.ipv6.join(', ') : '-' }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="text-xs text-slate-500 mt-1">暂无网络接口数据</div>
+
+            <div v-if="netShowExcluded && excludedNetworkIfaces.length" class="mt-3">
+              <div class="text-xs text-slate-400 mb-2">被过滤的接口（用于诊断规则）</div>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                <div v-for="(x, i) in excludedNetworkIfaces" :key="'ex_' + i" class="border border-slate-800 rounded p-3 bg-slate-950/30">
+                  <div class="text-slate-300 text-xs space-y-1">
+                    <div><span class="text-slate-400">名称：</span><span class="font-mono">{{ x.iface?.name || '未知' }}</span></div>
+                    <div><span class="text-slate-400">原因：</span><span class="font-mono text-amber-300">{{ (x.reasons || []).join(', ') }}</span></div>
+                    <div><span class="text-slate-400">MAC：</span><span class="font-mono">{{ x.iface?.mac || '无' }}</span></div>
+                    <div>
+                      <span class="text-slate-400">IPv4：</span>
+                      <span class="font-mono break-all">{{ (x.iface?.ipv4 || []).length ? x.iface.ipv4.join(', ') : '-' }}</span>
+                    </div>
+                    <div>
+                      <span class="text-slate-400">IPv6：</span>
+                      <span class="font-mono break-all">{{ (x.iface?.ipv6 || []).length ? x.iface.ipv6.join(', ') : '-' }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div v-else class="text-slate-500 text-sm">
+          等待 Agent 上报 hardware_details...
+        </div>
+      </section>
+
+      <!-- 实时进程/服务 -->
+      <section class="bg-slate-900/70 rounded-lg p-4 border border-slate-800 mb-6">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h2 class="text-lg font-semibold">实时进程/服务</h2>
+            <p class="text-xs text-slate-500 mt-1">process_snapshot</p>
+          </div>
+
+          <div class="inline-flex rounded-md bg-slate-800/80 border border-slate-700 overflow-hidden text-xs">
+            <button
+              type="button"
+              class="px-3 py-1.5"
+              :class="activeProcTab === 'process' ? 'bg-cyan-500 text-slate-950' : 'text-slate-300'"
+              @click="activeProcTab = 'process'"
+            >
+              实时进程
+            </button>
+            <button
+              type="button"
+              class="px-3 py-1.5"
+              :class="activeProcTab === 'service' ? 'bg-cyan-500 text-slate-950' : 'text-slate-300'"
+              @click="activeProcTab = 'service'"
+            >
+              系统服务
+            </button>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <input
+            v-model="snapshotQuery"
+            class="w-full bg-slate-950/60 border border-slate-800 rounded-md px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-cyan-500"
+            placeholder="搜索 PID / 进程名 / 执行路径 / 服务名"
+          />
+        </div>
+
+        <div v-if="parsedSnapshot">
+          <!-- 进程表格 -->
+          <div v-if="activeProcTab === 'process'">
+            <div class="text-xs text-slate-300 mb-2">进程（{{ filteredProcesses.length }}）</div>
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
+              <table class="min-w-full text-xs">
+                <thead class="bg-slate-800 text-slate-300">
+                  <tr>
+                    <th class="px-3 py-2 text-left">PID</th>
+                    <th class="px-3 py-2 text-left">进程名</th>
+                    <th class="px-3 py-2 text-left">执行路径</th>
+                    <th class="px-3 py-2 text-left">内存占用</th>
+                  </tr>
+                </thead>
+                <tbody v-if="filteredProcesses.length">
+                  <tr v-for="p in filteredProcesses" :key="p.PID + '_' + p.Name" class="border-t border-slate-800">
+                    <td class="px-3 py-2 font-mono">{{ p.PID }}</td>
+                    <td class="px-3 py-2 font-mono">{{ p.Name }}</td>
+                    <td class="px-3 py-2 font-mono">
+                      {{ shorten(p.ExecPath || p.exec_path, 60) }}
+                    </td>
+                    <td class="px-3 py-2 font-mono">{{ formatMB(p.MemoryUsage) }}</td>
+                  </tr>
+                </tbody>
+                <tbody v-else>
+                  <tr>
+                    <td colspan="4" class="px-3 py-4 text-center text-slate-500">
+                      暂无进程数据
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 服务表格 -->
+          <div v-else>
+            <div class="text-xs text-slate-300 mb-2">服务（{{ filteredServices.length }}）</div>
+            <div class="overflow-x-auto max-h-80 overflow-y-auto">
+              <table class="min-w-full text-xs">
+                <thead class="bg-slate-800 text-slate-300">
+                  <tr>
+                    <th class="px-3 py-2 text-left">服务名</th>
+                    <th class="px-3 py-2 text-left">服务状态</th>
+                  </tr>
+                </thead>
+                <tbody v-if="filteredServices.length">
+                  <tr v-for="s in filteredServices" :key="s.Name || s.name" class="border-t border-slate-800">
+                    <td class="px-3 py-2 font-mono">{{ s.Name || s.name }}</td>
+                    <td class="px-3 py-2 font-mono">
+                      <span :class="(s.Status || s.status) === 'Running' ? 'text-emerald-300' : 'text-slate-400'">
+                        {{ (s.Status || s.status) === 'Running' ? '正在运行' : '已停止' }}
+                      </span>
+                    </td>
+                  </tr>
+                </tbody>
+                <tbody v-else>
+                  <tr>
+                    <td colspan="2" class="px-3 py-4 text-center text-slate-500">
+                      暂无服务数据
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div v-else class="text-slate-500 text-sm">
+          等待 Agent 上报 process_snapshot...
+        </div>
+      </section>
+
+      <!-- 软件资产 -->
+      <section class="bg-slate-900/70 rounded-lg p-4 border border-slate-800 mb-6">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h2 class="text-lg font-semibold">网络与安全</h2>
+            <p class="text-xs text-slate-500 mt-1">security_snapshot</p>
+          </div>
+          <div class="inline-flex rounded-md bg-slate-800/80 border border-slate-700 overflow-hidden text-xs">
+            <button type="button" class="px-3 py-1.5" :class="activeSecurityTab === 'conn' ? 'bg-cyan-500 text-slate-950' : 'text-slate-300'" @click="activeSecurityTab = 'conn'">网络连接</button>
+            <button type="button" class="px-3 py-1.5" :class="activeSecurityTab === 'startup' ? 'bg-cyan-500 text-slate-950' : 'text-slate-300'" @click="activeSecurityTab = 'startup'">自启动</button>
+            <button type="button" class="px-3 py-1.5" :class="activeSecurityTab === 'hotfix' ? 'bg-cyan-500 text-slate-950' : 'text-slate-300'" @click="activeSecurityTab = 'hotfix'">系统补丁</button>
+          </div>
+        </div>
+
+        <div v-if="hasSecurityPanelData">
+          <div v-if="activeSecurityTab === 'conn'">
+            <div class="mb-2 flex flex-wrap items-center gap-3 text-xs text-slate-300">
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="connOnlyListen" class="accent-cyan-500" />
+                只看 LISTEN
+              </label>
+              <label class="inline-flex items-center gap-1">
+                <input type="checkbox" v-model="connOnlyEstablished" class="accent-cyan-500" />
+                只看 ESTABLISHED
+              </label>
+              <input
+                v-model="connQuery"
+                class="bg-slate-950/60 border border-slate-800 rounded-md px-3 py-1.5 text-xs outline-none focus:ring-2 focus:ring-cyan-500"
+                placeholder="搜索 进程名 / PID / 地址 / 端口 / 服务名(HTTP/RDP/MySQL...)"
+              />
+              <span class="text-slate-500">共 {{ filteredConnections.length }} 条</span>
+            </div>
+
+            <div class="overflow-x-auto max-h-80 overflow-y-auto">
+            <table class="min-w-full text-xs">
+              <thead class="bg-slate-800 text-slate-300">
+                <tr>
+                  <th class="px-3 py-2 text-left">协议</th>
+                  <th class="px-3 py-2 text-left">状态</th>
+                  <th class="px-3 py-2 text-left">本地地址</th>
+                  <th class="px-3 py-2 text-left">本地端口</th>
+                  <th class="px-3 py-2 text-left">远程地址</th>
+                  <th class="px-3 py-2 text-left">远程端口</th>
+                  <th class="px-3 py-2 text-left">PID</th>
+                  <th class="px-3 py-2 text-left">进程名</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(c, i) in filteredConnections" :key="i" class="border-t border-slate-800">
+                  <td class="px-3 py-2 font-mono">{{ c.protocol }}</td>
+                  <td class="px-3 py-2 font-mono">{{ c.state || '-' }}</td>
+                  <td class="px-3 py-2 font-mono">{{ c.local_addr }}</td>
+                  <td class="px-3 py-2 font-mono">
+                    <span :class="portTextClass(c.local_port)">
+                      {{ identifyPort(c.local_port) }}
+                    </span>
+                  </td>
+                  <td class="px-3 py-2 font-mono">{{ c.remote_addr || '-' }}</td>
+                  <td class="px-3 py-2 font-mono">
+                    <span v-if="c.remote_addr" :class="portTextClass(c.remote_port)">
+                      {{ identifyPort(c.remote_port) }}
+                    </span>
+                    <span v-else class="text-slate-500">-</span>
+                  </td>
+                  <td class="px-3 py-2 font-mono">{{ c.pid }}</td>
+                  <td class="px-3 py-2 font-mono">{{ c.process_name || pidName(c.pid) || '-' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          </div>
+
+          <div v-else-if="activeSecurityTab === 'startup'" class="overflow-x-auto max-h-80 overflow-y-auto">
+            <table class="min-w-full text-xs">
+              <thead class="bg-slate-800 text-slate-300">
+                <tr>
+                  <th class="px-3 py-2 text-left">位置</th>
+                  <th class="px-3 py-2 text-left">名称</th>
+                  <th class="px-3 py-2 text-left">命令</th>
+                  <th class="px-3 py-2 text-left">风险</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(s, i) in (parsedSecurity.startup || [])" :key="i" class="border-t border-slate-800">
+                  <td class="px-3 py-2 font-mono">{{ s.location }}</td>
+                  <td class="px-3 py-2 font-mono">{{ s.name }}</td>
+                  <td class="px-3 py-2 font-mono">{{ s.command }}</td>
+                  <td class="px-3 py-2 font-mono">
+                    <span :class="isTempStartupRisk(s) ? 'text-amber-300' : 'text-slate-400'">{{ isTempStartupRisk(s) ? '可疑 (Temp)' : '-' }}</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-else class="overflow-x-auto max-h-80 overflow-y-auto">
+            <table class="min-w-full text-xs">
+              <thead class="bg-slate-800 text-slate-300">
+                <tr>
+                  <th class="px-3 py-2 text-left">KB 编号</th>
+                  <th class="px-3 py-2 text-left">安装时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(h, i) in (parsedSecurity.hotfixes || [])" :key="i" class="border-t border-slate-800">
+                  <td class="px-3 py-2 font-mono">{{ h.kb }}</td>
+                  <td class="px-3 py-2 font-mono">{{ h.installed_at || '-' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div v-else class="text-slate-500 text-sm">等待 Agent 上报 network_connections / security_snapshot...</div>
+      </section>
+
+      <!-- 软件资产 -->
+      <section class="bg-slate-900/70 rounded-lg p-4 border border-slate-800 mb-6">
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h2 class="text-lg font-semibold">软件资产</h2>
+            <p class="text-xs text-slate-500 mt-1">software_inventory</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <input
+              v-model="softwareQuery"
+              class="bg-slate-950/60 border border-slate-800 rounded-md px-3 py-1.5 text-xs outline-none focus:ring-2 focus:ring-cyan-500"
+              placeholder="搜索名称 / 版本 / 发布者"
+            />
+            <span class="text-xs text-slate-500">共 {{ filteredSoftware.length }} 条</span>
+          </div>
+        </div>
+        <div v-if="filteredSoftware.length" class="overflow-x-auto max-h-96 overflow-y-auto">
+          <table class="min-w-full text-xs">
+            <thead class="bg-slate-800 text-slate-300">
+              <tr>
+                <th class="px-3 py-2 text-left">名称</th>
+                <th class="px-3 py-2 text-left">版本</th>
+                <th class="px-3 py-2 text-left">发布者</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(sw, idx) in filteredSoftware" :key="idx" class="border-t border-slate-800">
+                <td class="px-3 py-2 font-mono text-slate-100">{{ sw.name || sw.Name }}</td>
+                <td class="px-3 py-2 font-mono text-slate-300">{{ sw.version || sw.Version }}</td>
+                <td class="px-3 py-2 font-mono text-slate-300">
+                  {{ sw.publisher || sw.Publisher || '未知' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="text-slate-500 text-sm">
+          等待 Agent 上报 software_inventory...
+        </div>
+      </section>
+
+      <!-- 原始 JSON 调试区 -->
+      <section class="bg-slate-900/70 rounded-lg p-4 border border-slate-800">
+        <div class="flex justify-between items-center mb-2">
+          <h2 class="text-lg font-semibold">原始数据 (最后一包)</h2>
+          <span class="text-xs text-slate-500">仅调试用</span>
+        </div>
+        <pre class="text-xs bg-slate-950 rounded-md p-3 overflow-x-auto overflow-y-auto max-h-80 text-emerald-200">{{ prettyRaw }}</pre>
+      </section>
+    </div>
+
+    <script>
+      const { createApp, ref, computed, onMounted, watch } = Vue
+
+      createApp({
+        setup() {
+          // Multi-device store keyed by fingerprint
+          const devices = ref(Object.create(null))
+          const selectedDevice = ref('')
+          function ensureDevice(fp) {
+            const k = String(fp || '').trim()
+            if (!k) return null
+            if (!devices.value[k]) {
+              devices.value[k] = {
+                fp: k,
+                hostname: '',
+                os: '',
+                lastSeenAt: 0,
+                hostRaw: null,
+                hardwareRaw: null,
+                processRaw: null,
+                securityRaw: null,
+                serviceRaw: null,
+                networkConnRaw: null,
+                softwareRaw: null
+              }
+            }
+            return devices.value[k]
+          }
+          function extractFpHostOS(v) {
+            try {
+              const o = typeof v === 'string' ? JSON.parse(v) : v
+              return {
+                fp: String(o?.fingerprint || o?.Fingerprint || ''),
+                host: String(o?.hostname || o?.Hostname || ''),
+                os: String(o?.os || o?.OS || '')
+              }
+            } catch { return { fp: '', host: '', os: '' } }
+          }
+          function extractFpFromRawBatch(rb) {
+            try {
+              const b = typeof rb === 'string' ? JSON.parse(rb) : rb
+              if (!b || !Array.isArray(b.items)) return { fp: '', host: '', os: '' }
+              for (const it of b.items) {
+                if (it?.dataType === 'hardware_details' || it?.dataType === 'host_metrics') {
+                  const r = extractFpHostOS(it.payload)
+                  if (r.fp) return r
+                }
+              }
+            } catch {}
+            return { fp: '', host: '', os: '' }
+          }
+          const deviceOptions = computed(() => {
+            const list = Object.values(devices.value).sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+            return list.map(d => ({ fp: d.fp, label: d.hostname ? `${d.hostname} (${d.fp.slice(0,8)})` : d.fp }))
+          })
+          const onlineDevices = computed(() => {
+            const now = Date.now()
+            return Object.values(devices.value).filter(d => now - d.lastSeenAt < 2*60*1000)
+          })
+          const osSummary = computed(() => {
+            const mm = {}
+            for (const d of onlineDevices.value) {
+              const k = (d.os || 'Unknown').toLowerCase()
+              mm[k] = (mm[k] || 0) + 1
+            }
+            return Object.entries(mm).map(([os, count]) => ({ os, count }))
+          })
+          function osIcon(os) {
+            const s = String(os || '').toLowerCase()
+            if (s.includes('win')) return '🪟'
+            if (s.includes('mac') || s.includes('darwin') || s.includes('os x')) return '🍎'
+            if (s.includes('linux')) return '🐧'
+            return '💻'
+          }
+          const hostMetricsRaw = ref(null)
+          const hardwareRaw = ref(null)
+          const processSnapshotRaw = ref(null)
+          const securityRaw = ref(null)
+          const serviceRaw = ref(null)
+          const networkConnRaw = ref(null)
+          const softwareRaw = ref(null)
+          const rawBatch = ref(null)
+          const showHwDetail = ref(false)
+          // 当用户手动切换过一次后，关闭自动选择首台设备
+          const autoSelectEnabled = ref(true)
+          function onUserSelectDevice() {
+            autoSelectEnabled.value = false
+            console.log('[device] user selected device =', selectedDevice.value)
+          }
+          function populateProcessTablesFromRaw(snapRaw) {
+            try {
+              let snap = snapRaw
+              if (typeof snap === 'string') snap = JSON.parse(snap)
+              if (snap && snap.Payload) snap = snap.Payload
+              let procSrc = []
+              let svcSrc = []
+              if (Array.isArray(snap)) {
+                procSrc = snap
+              } else if (snap && typeof snap === 'object') {
+                procSrc = snap.Processes || snap.processes || []
+                svcSrc = snap.Services || snap.services || []
+              }
+              processes.value = procSrc.map((p) => ({
+                PID: p.PID ?? p.pid ?? 0,
+                Name: p.Name ?? p.name ?? '',
+                ExecPath: p.ExecPath ?? p.exec_path ?? '',
+                MemoryUsage: p.MemoryBytes ?? p.MemoryUsage ?? 0
+              }))
+              services.value = svcSrc.map((s) => ({
+                Name: s.Name ?? s.name ?? '',
+                Status: s.Status ?? s.status ?? ''
+              }))
+            } catch (e) {
+              console.error('populateProcessTablesFromRaw failed', e)
+            }
+          }
+          function applyDeviceToGlobals(fp) {
+            const d = devices.value[fp]
+            if (!d) return
+            if (d.hostRaw) hostMetricsRaw.value = d.hostRaw
+            if (d.hardwareRaw) hardwareRaw.value = d.hardwareRaw
+            if (d.processRaw) {
+              processSnapshotRaw.value = d.processRaw
+              populateProcessTablesFromRaw(d.processRaw)
+            }
+            if (d.securityRaw) securityRaw.value = d.securityRaw
+            if (d.serviceRaw) serviceRaw.value = d.serviceRaw
+            if (d.networkConnRaw) networkConnRaw.value = d.networkConnRaw
+            if (d.softwareRaw) softwareRaw.value = d.softwareRaw
+          }
+          watch(selectedDevice, (fp) => {
+            // Clear current view first to avoid showing previous device's数据
+            hostMetricsRaw.value = null
+            hardwareRaw.value = null
+            processSnapshotRaw.value = null
+            securityRaw.value = null
+            serviceRaw.value = null
+            networkConnRaw.value = null
+            softwareRaw.value = null
+            if (fp) {
+              console.log('[device] applying device to globals:', fp)
+              applyDeviceToGlobals(fp)
+            }
+          })
+
+          // Network filters (debug UI)
+          const netRequireIP = ref(true)
+          const netIncludeFilteredVirtual = ref(false)
+          const netIncludeLoopback = ref(false)
+          const netOnlyUp = ref(false)
+          const netShowExcluded = ref(false)
+
+          // 初始化响应式数组
+          const processes = ref([])
+          const services = ref([])
+
+          const parsedHost = computed(() => {
+            if (!hostMetricsRaw.value) return null
+            try {
+              return typeof hostMetricsRaw.value === 'string'
+                ? JSON.parse(hostMetricsRaw.value)
+                : hostMetricsRaw.value
+            } catch {
+              return null
+            }
+          })
+
+          const parsedHardware = computed(() => {
+            if (!hardwareRaw.value) return null
+            try {
+              return typeof hardwareRaw.value === 'string'
+                ? JSON.parse(hardwareRaw.value)
+                : hardwareRaw.value
+            } catch {
+              return null
+            }
+          })
+
+          const snapshotQuery = ref('')
+          const activeProcTab = ref('process')
+          const activeSecurityTab = ref('conn')
+
+          // Connections filters + PID->process cache (local)
+          const connOnlyListen = ref(false)
+          const connOnlyEstablished = ref(false)
+          const connQuery = ref('')
+          const pidNameCache = ref(Object.create(null)) // pid(string) -> name
+
+          // Common port mapping dictionary (port -> service name)
+          const PORT_MAP = Object.freeze({
+            80: 'HTTP',
+            443: 'HTTPS',
+            21: 'FTP',
+            22: 'SSH',
+            23: 'Telnet',
+            3389: '远程桌面 (RDP)',
+            445: '文件共享 (SMB)',
+            135: 'RPC',
+            1433: 'SQL Server',
+            3306: 'MySQL',
+            5432: 'PostgreSQL',
+            6379: 'Redis',
+            8080: 'HTTP 代理/备用',
+            27017: 'MongoDB',
+            1521: 'Oracle'
+          })
+
+          const RISK_PORTS = new Set([3389, 445, 21])
+
+          const parsedSecurity = computed(() => {
+            if (!securityRaw.value) return null
+            try {
+              return typeof securityRaw.value === 'string' ? JSON.parse(securityRaw.value) : securityRaw.value
+            } catch {
+              return null
+            }
+          })
+
+          const parsedNetworkConnections = computed(() => {
+            if (!networkConnRaw.value) return null
+            try {
+              return typeof networkConnRaw.value === 'string' ? JSON.parse(networkConnRaw.value) : networkConnRaw.value
+            } catch {
+              return null
+            }
+          })
+
+          const hasSecurityPanelData = computed(() => {
+            return !!(parsedNetworkConnections.value || parsedSecurity.value)
+          })
+
+          const connectionsList = computed(() => {
+            // Prefer lightweight periodic network_connections; fall back to security_snapshot.connections.
+            const nc = parsedNetworkConnections.value
+            const sec = parsedSecurity.value
+            const list =
+              (nc && Array.isArray(nc.connections) ? nc.connections : null) ||
+              (sec && Array.isArray(sec.connections) ? sec.connections : []) ||
+              []
+            // Normalize minimal fields to keep template stable and reduce repeated coercions.
+            return list.map((c) => ({
+              protocol: c.protocol ?? c.Protocol ?? '',
+              state: c.state ?? c.State ?? '',
+              local_addr: c.local_addr ?? c.LocalAddr ?? '',
+              local_port: c.local_port ?? c.LocalPort ?? 0,
+              remote_addr: c.remote_addr ?? c.RemoteAddr ?? '',
+              remote_port: c.remote_port ?? c.RemotePort ?? 0,
+              pid: c.pid ?? c.PID ?? 0,
+              process_name: c.process_name ?? c.ProcessName ?? ''
+            }))
+          })
+
+          function pidName(pid) {
+            const k = String(pid ?? '')
+            return pidNameCache.value[k] || ''
+          }
+
+          function identifyPort(port) {
+            const p = Number(port)
+            if (!p || Number.isNaN(p)) return '-'
+            const svc = PORT_MAP[p]
+            return svc ? `${p} (${svc})` : String(p)
+          }
+
+          function isRiskPort(port) {
+            const p = Number(port)
+            if (!p || Number.isNaN(p)) return false
+            return RISK_PORTS.has(p)
+          }
+
+          function portTextClass(port) {
+            return isRiskPort(port) ? 'text-amber-300' : 'text-slate-100'
+          }
+
+          const filteredConnections = computed(() => {
+            const list = connectionsList.value || []
+            const q = (connQuery.value || '').trim().toLowerCase()
+            const onlyListen = !!connOnlyListen.value
+            const onlyEst = !!connOnlyEstablished.value
+
+            return list.filter((c) => {
+              const state = String(c.state || '').toUpperCase()
+              if (onlyListen && state !== 'LISTEN') return false
+              if (onlyEst && state !== 'ESTABLISHED') return false
+
+              if (!q) return true
+              const pidStr = String(c.pid ?? '')
+              const name = String(c.process_name || pidName(c.pid) || '').toLowerCase()
+              const lAddr = String(c.local_addr || '').toLowerCase()
+              const rAddr = String(c.remote_addr || '').toLowerCase()
+              const lp = String(c.local_port ?? '').toLowerCase()
+              const rp = String(c.remote_port ?? '').toLowerCase()
+              const lpLabel = identifyPort(c.local_port).toLowerCase()
+              const rpLabel = identifyPort(c.remote_port).toLowerCase()
+              return (
+                name.includes(q) ||
+                pidStr.includes(q) ||
+                lAddr.includes(q) ||
+                rAddr.includes(q) ||
+                lp.includes(q) ||
+                rp.includes(q) ||
+                lpLabel.includes(q) ||
+                rpLabel.includes(q)
+              )
+            })
+          })
+
+          const softwareList = computed(() => {
+            if (!softwareRaw.value) return []
+            try {
+              const v = typeof softwareRaw.value === 'string'
+                ? JSON.parse(softwareRaw.value)
+                : softwareRaw.value
+              return Array.isArray(v) ? v : []
+            } catch {
+              return []
+            }
+          })
+
+          const softwareQuery = ref('')
+
+          const filteredSoftware = computed(() => {
+            const list = softwareList.value
+            const q = (softwareQuery.value || '').trim().toLowerCase()
+            if (!q) return list
+            return list.filter((sw) => {
+              const name = String(sw.name ?? sw.Name ?? '').toLowerCase()
+              const ver = String(sw.version ?? sw.Version ?? '').toLowerCase()
+              const pub = String(sw.publisher ?? sw.Publisher ?? '').toLowerCase()
+              return name.includes(q) || ver.includes(q) || pub.includes(q)
+            })
+          })
+
+          const filteredProcesses = computed(() => {
+            const list = processes.value || []
+            const q = (snapshotQuery.value || '').trim().toLowerCase()
+            if (!q) return list
+
+            const pid = Number(q)
+            return list.filter((p) => {
+              const name = String(p.Name ?? '').toLowerCase()
+              const exec = String(p.ExecPath ?? '').toLowerCase()
+              if (!Number.isNaN(pid) && String(p.PID) === String(pid)) return true
+              return name.includes(q) || exec.includes(q)
+            })
+          })
+
+          const filteredServices = computed(() => {
+            const list = services.value || []
+            const q = (snapshotQuery.value || '').trim().toLowerCase()
+            if (!q) return list
+            return list.filter(s => {
+              const name = String(s.name ?? s.Name ?? '').toLowerCase()
+              const status = String(s.status ?? s.Status ?? '').toLowerCase()
+              return name.includes(q) || status.includes(q)
+            })
+          })
+
+          const networkIfaceList = computed(() => {
+            const hw = parsedHardware.value
+            return hw && Array.isArray(hw.network_ifaces) ? hw.network_ifaces : []
+          })
+
+          const networkIfaceTotal = computed(() => networkIfaceList.value.length)
+
+          const excludedNetworkIfaces = computed(() => {
+            try {
+              const list = networkIfaceList.value
+              const out = []
+              for (const n of list) {
+                const r = evaluateIface(n)
+                if (!r.ok) out.push({ iface: n, reasons: r.reasons })
+              }
+              return out
+            } catch (e) {
+              console.error('excludedNetworkIfaces failed', e)
+              return []
+            }
+          })
+
+          const filteredNetworkIfaces = computed(() => {
+            try {
+              const list = networkIfaceList.value
+              return list.filter((n) => evaluateIface(n).ok)
+            } catch (e) {
+              console.error('filteredNetworkIfaces failed', e)
+              return []
+            }
+          })
+
+          const prettyRaw = computed(() => {
+            if (!rawBatch.value) return '// 等待数据...'
+            try {
+              return JSON.stringify(rawBatch.value, null, 2)
+            } catch {
+              return String(rawBatch.value)
+            }
+          })
+
+          function formatBytes(b) {
+            if (!b || isNaN(b)) return '0 B'
+            const units = ['B', 'KB', 'MB', 'GB', 'TB']
+            let i = 0
+            let v = Number(b)
+            while (v >= 1024 && i < units.length - 1) {
+              v /= 1024
+              i++
+            }
+            return v.toFixed(1) + ' ' + units[i]
+          }
+
+          function formatMB(b) {
+            const v = Number(b || 0) / (1024 * 1024)
+            return v.toFixed(2) + ' MB'
+          }
+
+          function formatUptime(sec) {
+            const s = Number(sec || 0)
+            if (!s) return '未知'
+            const d = Math.floor(s / 86400)
+            const h = Math.floor((s % 86400) / 3600)
+            const m = Math.floor((s % 3600) / 60)
+            const parts = []
+            if (d) parts.push(`${d}天`)
+            if (h || d) parts.push(`${h}小时`)
+            parts.push(`${m}分`)
+            return parts.join(' ')
+          }
+
+          function shorten(s, maxLen) {
+            const v = String(s ?? '')
+            if (!v) return ''
+            if (!maxLen || v.length <= maxLen) return v
+            return v.slice(0, maxLen - 1) + '…'
+          }
+
+          function displayOr(v, dflt) {
+            const s = String(v ?? '').trim()
+            return s ? s : (dflt ?? '读取中...')
+          }
+
+          function isTempStartupRisk(s) {
+            const cmd = String(s?.command || '').toLowerCase()
+            return cmd.includes('\\temp\\') || cmd.includes('/temp/')
+          }
+
+          function hasIP(n) {
+            const v4 = Array.isArray(n?.ipv4) ? n.ipv4 : []
+            const v6 = Array.isArray(n?.ipv6) ? n.ipv6 : []
+            return v4.length > 0 || v6.length > 0
+          }
+
+          function isWirelessName(name) {
+            const s = String(name || '').toLowerCase()
+            return s.includes('wi-fi') || s.includes('wifi') || s.includes('wlan') || s.includes('wireless') || s.includes('802.11')
+          }
+
+          function isVirtualName(name) {
+            const s = String(name || '').toLowerCase()
+            const bad = [
+              // Keep VM guest NICs visible; only filter tunnel/container/overlay adapters.
+              'loopback', 'docker', 'container',
+              'wintun', 'tap', 'tun', 'npcap', 'tailscale', 'zerotier', 'hamachi'
+            ]
+            return bad.some(k => s.includes(k))
+          }
+
+          function hasValidMAC(mac) {
+            const s = String(mac || '').trim().toLowerCase()
+            if (!s) return false
+            if (s === '00:00:00:00:00:00' || s === '00-00-00-00-00-00') return false
+            return true
+          }
+
+          function evaluateIface(n) {
+            const reasons = []
+            if (!n) return { ok: false, reasons: ['nil'] }
+
+            if (n.is_loopback && !netIncludeLoopback.value) reasons.push('loopback')
+            if (netOnlyUp.value && !n.is_up) reasons.push('down')
+
+            if (netRequireIP.value && !hasIP(n)) reasons.push('no_ip')
+
+            const name = n.name || ''
+            const filteredVirtual = isVirtualName(name)
+            if (filteredVirtual && !netIncludeFilteredVirtual.value) reasons.push('filtered_virtual')
+
+            // Default behavior: show wireless even if MAC is missing (some platforms hide it),
+            // but for wired we expect a valid MAC unless it's a filtered-virtual adapter.
+            const wireless = isWirelessName(name)
+            if (!wireless && !filteredVirtual && !hasValidMAC(n.mac)) reasons.push('bad_mac')
+
+            return { ok: reasons.length === 0, reasons }
+          }
+
+          function connectWS() {
+            const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
+            const wsUrl = `${protocol}://${location.host}/ws`
+            const ws = new WebSocket(wsUrl)
+
+            ws.onmessage = (ev) => {
+              try {
+                const data = JSON.parse(ev.data)
+                console.log('收到 WebSocket 数据:', data)
+
+                // Multi-device routing
+                let fp = '', host = '', os = ''
+                if (data.hardware_details) { const r = extractFpHostOS(data.hardware_details); if (r.fp) { fp=r.fp; host=r.host; os=r.os } }
+                if (!fp && data.host_metrics) { const r = extractFpHostOS(data.host_metrics); if (r.fp) { fp=r.fp; host=r.host; os=r.os } }
+                if (!fp && data.raw_batch) { const r = extractFpFromRawBatch(data.raw_batch); if (r.fp) { fp=r.fp; host=r.host; os=r.os } }
+                if (fp) {
+                  const d = ensureDevice(fp)
+                  if (d) {
+                    if (host) d.hostname = host
+                    if (os) d.os = os
+                    if (data.host_metrics) d.hostRaw = data.host_metrics
+                    if (data.hardware_details) d.hardwareRaw = data.hardware_details
+                    if (data.process_snapshot) d.processRaw = data.process_snapshot
+                    if (data.security_snapshot) d.securityRaw = data.security_snapshot
+                    if (data.service_snapshot) d.serviceRaw = data.service_snapshot
+                    if (data.network_connections) d.networkConnRaw = data.network_connections
+                    // 软件资产：优先使用顶层 software_inventory，若不存在则从 raw_batch.items 中回溯一次
+                    let swPayload = data.software_inventory
+                    if (!swPayload && data.raw_batch && Array.isArray(data.raw_batch.items)) {
+                      for (const it of data.raw_batch.items) {
+                        if (it.dataType === 'software_inventory' && it.payload) {
+                          swPayload = it.payload
+                          break
+                        }
+                      }
+                    }
+                    if (swPayload) d.softwareRaw = swPayload
+                    d.lastSeenAt = Date.now()
+                  }
+                  // 仅当未选择设备且允许自动选择时设置默认；否则绝不改写用户选择
+                  if (!selectedDevice.value && autoSelectEnabled.value) {
+                    selectedDevice.value = fp
+                    console.log('[device] auto-selected device =', fp)
+                  }
+                  // 仅当当前消息属于选中设备时，才更新全局展示数据
+                  if (selectedDevice.value === fp) {
+                    console.log('[device] update globals for selected fp =', fp)
+                    // 原子方式应用：根据设备仓库写入全局视图
+                    applyDeviceToGlobals(fp)
+                    // 附带：解析并刷新进程表与 PID->Name 缓存（仅对选中设备）
+                    if (data.process_snapshot) {
+                      try {
+                        populateProcessTablesFromRaw(data.process_snapshot)
+                        const next = Object.assign(Object.create(null), pidNameCache.value)
+                        for (const p of processes.value) {
+                          const pid = String(p.PID ?? '')
+                          const name = String(p.Name ?? '').trim()
+                          if (pid && name) next[pid] = name
+                        }
+                        pidNameCache.value = next
+                      } catch (e) {
+                        console.error('解析 process_snapshot 失败', e)
+                      }
+                    }
+                    if (data.security_snapshot) {
+                      try {
+                        const v = typeof data.security_snapshot === 'string' ? JSON.parse(data.security_snapshot) : data.security_snapshot
+                        const conns = v && Array.isArray(v.connections) ? v.connections : []
+                        if (conns.length) {
+                          const next = Object.assign(Object.create(null), pidNameCache.value)
+                          for (const c of conns) {
+                            const pid = String(c.pid ?? c.PID ?? '')
+                            const name = String(c.process_name ?? c.ProcessName ?? '').trim()
+                            if (pid && name) next[pid] = name
+                          }
+                          pidNameCache.value = next
+                        }
+                      } catch (e) {
+                        console.warn('security_snapshot parse for pid cache failed', e)
+                      }
+                    }
+                  }
+                } else {
+                  // 无法解析出设备指纹的消息，保持旧逻辑但不覆盖全局：只记录原始批次用于调试
+                  if (data.raw_batch) rawBatch.value = data.raw_batch
+                }
+                // raw_batch 仅用于“原始数据”调试区展示
+                if (data.raw_batch) rawBatch.value = data.raw_batch
+              } catch (e) {
+                console.error('parse ws data failed', e)
+              }
+            }
+
+            ws.onclose = () => {
+              // 简单重连
+              setTimeout(connectWS, 2000)
+            }
+          }
+
+          onMounted(() => {
+            connectWS()
+          })
+
+          return {
+            devices,
+            selectedDevice,
+            deviceOptions,
+            onlineDevices,
+            osSummary,
+            osIcon,
+            showHwDetail,
+            parsedHost,
+            parsedHardware,
+            // parsedSnapshot 不再直接用于表格，但保留用于原始视图
+            parsedSnapshot: computed(() => {
+              if (!processSnapshotRaw.value) return null
+              try {
+                return typeof processSnapshotRaw.value === 'string'
+                  ? JSON.parse(processSnapshotRaw.value)
+                  : processSnapshotRaw.value
+              } catch {
+                return null
+              }
+            }),
+            snapshotQuery,
+            activeProcTab,
+            activeSecurityTab,
+            filteredProcesses,
+            filteredServices,
+            parsedSecurity,
+            hasSecurityPanelData,
+            connOnlyListen,
+            connOnlyEstablished,
+            connQuery,
+            filteredConnections,
+            pidName,
+            identifyPort,
+            portTextClass,
+            softwareQuery,
+            filteredSoftware,
+            netRequireIP,
+            netIncludeFilteredVirtual,
+            netIncludeLoopback,
+            netOnlyUp,
+            netShowExcluded,
+            excludedNetworkIfaces,
+            networkIfaceTotal,
+            filteredNetworkIfaces,
+            prettyRaw,
+            formatBytes,
+             formatMB,
+              displayOr,
+            isTempStartupRisk,
+            formatUptime,
+            shorten
+          }
+        }
+      }).mount('#app')
+    </script>
+  </body>
+  </html>
+
