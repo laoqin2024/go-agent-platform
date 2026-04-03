@@ -8,13 +8,13 @@ export default defineConfig({
     proxy: {
       // Avoid CORS during development by proxying API requests to Go backend.
       "/api": {
-        target: "http://localhost:8080",
+        target: "http://127.0.0.1:8080",
         changeOrigin: true,
       },
       // WebSocket: frontend connects to `/ws/:device_id` on same-origin;
       // we proxy it to the Go backend so LAN clients work without env vars.
       "/ws": {
-        target: "http://localhost:8080",
+        target: "http://127.0.0.1:8080",
         changeOrigin: true,
         ws: true,
       },

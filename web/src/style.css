@@ -2,3 +2,11 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Constrain app to single viewport; only inner panes scroll */
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+}
+body {
+  margin: 0;
+}

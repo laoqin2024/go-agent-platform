@@ -203,6 +203,59 @@ function swPublisher(s: any) {
   return s?.Publisher ?? s?.publisher ?? "";
 }
 
+function parseInstallDateRaw(s: any): string {
+  // Try common fields across platforms/payloads
+  const raw =
+    s?.InstallDate ??
+    s?.install_date ??
+    s?.InstalledOn ??
+    s?.installed_on ??
+    s?.LastModified ??
+    s?.last_modified ??
+    s?.lastModified ??
+    "";
+  const v = raw as any;
+  if (!v) return "";
+  // Numbers: treat as epoch (s or ms)
+  if (typeof v === "number") {
+    const ms = v < 1e11 ? v * 1000 : v;
+    const d = new Date(ms);
+    return isNaN(d.getTime()) ? "" : d.toISOString();
+  }
+  const str = String(v).trim();
+  if (!str) return "";
+  // Windows common: YYYYMMDD
+  if (/^\d{8}$/.test(str)) {
+    const y = str.slice(0, 4);
+    const m = str.slice(4, 6);
+    const d = str.slice(6, 8);
+    return `${y}-${m}-${d}`;
+  }
+  // ISO-like string
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) return d.toISOString();
+  // Fallback: return as-is
+  return str;
+}
+
+function formatDateLocal(s: string): string {
+  if (!s) return "";
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+      d.getDate()
+    ).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(
+      2,
+      "0"
+    )}`;
+  }
+  return s;
+}
+
+function swInstallDateText(s: any) {
+  return formatDateLocal(parseInstallDateRaw(s));
+}
+
 function memorySpeedText(v: any) {
   if (v == null) return "未采集";
   const s = String(v).trim();
@@ -324,7 +377,7 @@ function memorySpeedText(v: any) {
               </div>
               <div v-if="hwDisks.length" class="overflow-x-auto">
                 <table class="min-w-full text-xs">
-                  <thead class="bg-slate-800 text-slate-300">
+                  <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
                     <tr>
                       <th class="px-2 py-1 text-left">型号</th>
                       <th class="px-2 py-1 text-left">类型</th>
@@ -378,7 +431,7 @@ function memorySpeedText(v: any) {
               </div>
               <div v-else-if="hwMemorySlots.length" class="overflow-x-auto">
                 <table class="min-w-full text-xs">
-                  <thead class="bg-slate-800 text-slate-300">
+                  <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
                     <tr>
                       <th class="px-2 py-1 text-left">槽位</th>
                       <th class="px-2 py-1 text-left">容量</th>
@@ -410,7 +463,7 @@ function memorySpeedText(v: any) {
               </div>
               <div v-if="hwIfaces.length" class="overflow-x-auto">
                 <table class="min-w-full text-xs">
-                  <thead class="bg-slate-800 text-slate-300">
+                  <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
                     <tr>
                       <th class="px-2 py-1 text-left">名称</th>
                       <th class="px-2 py-1 text-left">MAC</th>
@@ -486,7 +539,7 @@ function memorySpeedText(v: any) {
 
         <div v-if="filteredProcesses && filteredProcesses.length" class="flex-1 min-h-0 overflow-auto">
           <table class="min-w-full text-xs">
-            <thead class="bg-slate-800 text-slate-300">
+            <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
               <tr>
                 <th class="px-3 py-2 text-left">PID</th>
                 <th class="px-3 py-2 text-left">名称</th>
@@ -536,7 +589,7 @@ function memorySpeedText(v: any) {
           />
         </div>
 
-        <div v-if="isWindowsDevice && (filteredNormalSoftware.length || filteredWindowsPatches.length)" class="flex-1 min-h-0 overflow-auto space-y-3">
+        <div v-if="isWindowsDevice && (filteredNormalSoftware.length || filteredWindowsPatches.length)" class="flex-1 min-h-0 overflow-hidden space-y-3">
           <div class="rounded border border-slate-800/70">
             <div class="px-3 py-2 text-xs text-slate-300 bg-slate-800/60 flex items-center justify-between">
               <span>普通软件</span>
@@ -544,11 +597,12 @@ function memorySpeedText(v: any) {
             </div>
             <div class="max-h-[30vh] overflow-auto">
               <table class="min-w-full text-xs">
-                <thead class="bg-slate-800 text-slate-300">
+                <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
                   <tr>
                     <th class="px-3 py-2 text-left">名称</th>
                     <th class="px-3 py-2 text-left">版本</th>
                     <th class="px-3 py-2 text-left">发布者</th>
+                    <th class="px-3 py-2 text-left">安装/更新日期</th>
                   </tr>
                 </thead>
                 <tbody class="bg-slate-900/30">
@@ -560,6 +614,7 @@ function memorySpeedText(v: any) {
                     <td class="px-3 py-2 font-mono text-slate-200 break-all">{{ swName(s) || "未采集" }}</td>
                     <td class="px-3 py-2 font-mono text-slate-400 break-all">{{ swVersion(s) || "-" }}</td>
                     <td class="px-3 py-2 font-mono text-slate-500 break-all">{{ swPublisher(s) || "-" }}</td>
+                    <td class="px-3 py-2 font-mono text-slate-500 break-all">{{ swInstallDateText(s) || "-" }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -573,11 +628,12 @@ function memorySpeedText(v: any) {
             </div>
             <div v-if="filteredWindowsPatches.length" class="max-h-[30vh] overflow-auto">
               <table class="min-w-full text-xs">
-                <thead class="bg-slate-800 text-slate-300">
+                <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
                   <tr>
                     <th class="px-3 py-2 text-left">名称</th>
                     <th class="px-3 py-2 text-left">版本</th>
                     <th class="px-3 py-2 text-left">发布者</th>
+                    <th class="px-3 py-2 text-left">安装/更新日期</th>
                   </tr>
                 </thead>
                 <tbody class="bg-slate-900/30">
@@ -589,6 +645,7 @@ function memorySpeedText(v: any) {
                     <td class="px-3 py-2 font-mono text-slate-200 break-all">{{ swName(s) || "未采集" }}</td>
                     <td class="px-3 py-2 font-mono text-slate-400 break-all">{{ swVersion(s) || "-" }}</td>
                     <td class="px-3 py-2 font-mono text-slate-500 break-all">{{ swPublisher(s) || "-" }}</td>
+                    <td class="px-3 py-2 font-mono text-slate-500 break-all">{{ swInstallDateText(s) || "-" }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -599,11 +656,12 @@ function memorySpeedText(v: any) {
 
         <div v-else-if="filteredSoftware && filteredSoftware.length" class="flex-1 min-h-0 overflow-auto">
           <table class="min-w-full text-xs">
-            <thead class="bg-slate-800 text-slate-300">
+            <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
               <tr>
                 <th class="px-3 py-2 text-left">名称</th>
                 <th class="px-3 py-2 text-left">版本</th>
                 <th class="px-3 py-2 text-left">发布者</th>
+                <th class="px-3 py-2 text-left">安装/更新日期</th>
               </tr>
             </thead>
             <tbody class="bg-slate-900/30">
@@ -620,6 +678,9 @@ function memorySpeedText(v: any) {
                 </td>
                 <td class="px-3 py-2 font-mono text-slate-500 break-all">
                   {{ swPublisher(s) || "-" }}
+                </td>
+                <td class="px-3 py-2 font-mono text-slate-500 break-all">
+                  {{ swInstallDateText(s) || "-" }}
                 </td>
               </tr>
             </tbody>
@@ -638,7 +699,7 @@ function memorySpeedText(v: any) {
         </div>
         <div v-if="connections.length" class="flex-1 min-h-0 overflow-auto">
           <table class="min-w-full text-xs">
-            <thead class="bg-slate-800 text-slate-300">
+            <thead class="bg-slate-800 text-slate-300 sticky top-0 z-10">
               <tr>
                 <th class="px-3 py-2 text-left">协议</th>
                 <th class="px-3 py-2 text-left">状态</th>

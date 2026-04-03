@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from "vue";
+import { onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import DeviceList from "./components/DeviceList.vue";
 import DeviceDetail from "./components/DeviceDetail.vue";
 import { request } from "./utils/request";
@@ -58,6 +58,8 @@ const currentDevice = reactive<CurrentDevice>({
 });
 
 let seq = 0;
+let metricsTick: number | null = null;
+const lastHostMetricsAtMs = ref<number>(0);
 
 function firstProcFeature(arr: any[]) {
   const p = arr?.[0];
@@ -148,7 +150,10 @@ function updateDeviceMetaFromPayload(deviceId: string, payload: any) {
   devices.value[idx] = next;
 }
 
-const ws = useWebSocket((data: any) => {
+const ws = useWebSocket((data: any, raw: any) => {
+  // Raw payload helps verify whether WS proxy/route is working and messages are arriving.
+  // eslint-disable-next-line no-console
+  console.log("WebSocket 收到原始数据:", raw);
   const incomingDeviceId =
     data?.device_id ?? data?.deviceId ?? data?.DeviceID ?? currentDevice.deviceId;
   if (!incomingDeviceId) return;
@@ -202,14 +207,29 @@ const ws = useWebSocket((data: any) => {
   // Mark WS received for this device, even if only one side updated.
   currentDevice.wsReceived = true;
 
-  // Extended dashboard fields (debug_server compatible)
-  if ("host_metrics" in data) currentDevice.hostMetrics = normalizeObject(data.host_metrics);
-  if ("hardware_details" in data) currentDevice.hardwareDetails = normalizeObject(data.hardware_details);
-  if ("network_connections" in data) currentDevice.networkConnections = normalizeObject(data.network_connections);
-  if ("security_snapshot" in data) currentDevice.securitySnapshot = normalizeObject(data.security_snapshot);
-  if ("service_snapshot" in data) currentDevice.serviceSnapshot = normalizeObject(data.service_snapshot);
-  if ("process_snapshot" in data) currentDevice.processSnapshot = normalizeObject(data.process_snapshot);
-  if ("software_inventory" in data) currentDevice.softwareInventory = normalizeObject(data.software_inventory);
+  // Extended dashboard fields (accept snake_case and camelCase)
+  if ("host_metrics" in data || "hostMetrics" in data) {
+    currentDevice.hostMetrics = normalizeObject((data as any).host_metrics ?? (data as any).hostMetrics);
+    lastHostMetricsAtMs.value = Date.now();
+  }
+  if ("hardware_details" in data || "hardwareDetails" in data) {
+    currentDevice.hardwareDetails = normalizeObject((data as any).hardware_details ?? (data as any).hardwareDetails);
+  }
+  if ("network_connections" in data || "networkConnections" in data) {
+    currentDevice.networkConnections = normalizeObject((data as any).network_connections ?? (data as any).networkConnections);
+  }
+  if ("security_snapshot" in data || "securitySnapshot" in data) {
+    currentDevice.securitySnapshot = normalizeObject((data as any).security_snapshot ?? (data as any).securitySnapshot);
+  }
+  if ("service_snapshot" in data || "serviceSnapshot" in data) {
+    currentDevice.serviceSnapshot = normalizeObject((data as any).service_snapshot ?? (data as any).serviceSnapshot);
+  }
+  if ("process_snapshot" in data || "processSnapshot" in data) {
+    currentDevice.processSnapshot = normalizeObject((data as any).process_snapshot ?? (data as any).processSnapshot);
+  }
+  if ("software_inventory" in data || "softwareInventory" in data) {
+    currentDevice.softwareInventory = normalizeObject((data as any).software_inventory ?? (data as any).softwareInventory);
+  }
 
   const updatedAt =
     data?.updated_at ?? data?.updatedAt ?? data?.UpdatedAtSec ?? 0;
@@ -222,7 +242,7 @@ const ws = useWebSocket((data: any) => {
   }
 
   // Keep device list meta fresh if agent pushes host_metrics/hardware_details via WS.
-  if ("host_metrics" in data || "hardware_details" in data) {
+  if ("host_metrics" in data || "hardware_details" in data || "hostMetrics" in data || "hardwareDetails" in data) {
     updateDeviceMetaFromPayload(incomingDeviceId, data);
   }
 });
@@ -240,6 +260,9 @@ async function fetchSnapshot(deviceId: string, mySeq: number) {
     currentDevice.processes = processes;
     currentDevice.softwareList = softwareList;
     currentDevice.hostMetrics = normalizeObject(resp.data?.host_metrics);
+    if (currentDevice.hostMetrics) {
+      lastHostMetricsAtMs.value = Date.now();
+    }
     currentDevice.hardwareDetails = normalizeObject(resp.data?.hardware_details);
     currentDevice.networkConnections = normalizeObject(resp.data?.network_connections);
     currentDevice.securitySnapshot = normalizeObject(resp.data?.security_snapshot);
@@ -313,6 +336,35 @@ watch(
   }
 );
 
+// Lightweight auto-retry: if WS在线但长时间未收到 host_metrics，定时通过 HTTP 再拉一次快照补齐。
+function ensureMetricsPolling() {
+  if (metricsTick != null) {
+    window.clearInterval(metricsTick);
+    metricsTick = null;
+  }
+  metricsTick = window.setInterval(() => {
+    if (!currentDevice.deviceId) return;
+    // If no metrics ever, or超过10秒未更新，则补拉一次。
+    const stale = Date.now() - (lastHostMetricsAtMs.value || 0);
+    if (stale > 10_000) {
+      seq++;
+      const mySeq = seq;
+      void fetchSnapshot(currentDevice.deviceId, mySeq);
+    }
+  }, 7000);
+}
+
+onMounted(() => {
+  ensureMetricsPolling();
+});
+
+onUnmounted(() => {
+  if (metricsTick != null) {
+    window.clearInterval(metricsTick);
+    metricsTick = null;
+  }
+});
+
 // Initial load: fetch device ids from backend so LAN users don't start from an empty list.
 onMounted(async () => {
   try {
@@ -337,7 +389,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="min-h-screen flex bg-slate-950 text-slate-100">
+  <div class="h-screen flex bg-slate-950 text-slate-100 overflow-hidden">
     <aside class="w-full lg:w-80">
       <DeviceList
         :devices="devices"

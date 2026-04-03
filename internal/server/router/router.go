@@ -29,20 +29,30 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	r.Use(middleware.Recover())
 
 	// CORS for browser-based frontend (e.g. Vite dev server).
-	allowedOrigins := []string{"http://localhost:5173"}
+	// Default: allow all origins to simplify LAN development (access via IP).
+	// To restrict in production, set CORS_ORIGINS="http://host1:5173,http://host2".
 	if v := strings.TrimSpace(os.Getenv("CORS_ORIGINS")); v != "" {
-		allowedOrigins = strings.Split(v, ",")
-		for i := range allowedOrigins {
-			allowedOrigins[i] = strings.TrimSpace(allowedOrigins[i])
+		allowed := strings.Split(v, ",")
+		for i := range allowed {
+			allowed[i] = strings.TrimSpace(allowed[i])
 		}
+		r.Use(cors.New(cors.Config{
+			AllowOrigins:     allowed,
+			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+			AllowCredentials: false,
+			MaxAge:           12 * time.Hour,
+		}))
+	} else {
+		// Allow any origin (including http://<LAN-IP>:5173) when no explicit list provided.
+		r.Use(cors.New(cors.Config{
+			AllowOrigins:     []string{"*"},
+			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+			AllowCredentials: false,
+			MaxAge:           12 * time.Hour,
+		}))
 	}
-	r.Use(cors.New(cors.Config{
-		AllowOrigins:     allowedOrigins,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		AllowCredentials: false,
-		MaxAge:           12 * time.Hour,
-	}))
 
 	// Basic health for orchestration.
 	r.GET("/healthz", func(c *gin.Context) {

@@ -87,6 +87,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		// Read loop: discard messages. Clients might send pings; we just consume.
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
+				h.logger.Debug("ws read loop exit", "device_id", deviceID, "err", err)
 				break
 			}
 		}
@@ -109,6 +110,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		}
 	}()
 
-	// Handler must return; the read goroutine keeps connection alive.
-	c.Status(http.StatusOK)
+	// IMPORTANT: After Upgrade the connection is hijacked by Gorilla WS.
+	// Do NOT write any HTTP status/headers via gin; simply return to finish the handler.
+	return
 }
