@@ -57,3 +57,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Do not sync screenshots/images
+image/
