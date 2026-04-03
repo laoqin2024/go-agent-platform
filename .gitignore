@@ -5,14 +5,22 @@ data_ui/
 
 # Build outputs / binaries
 dist/
+bin/
+build/
+out/
 *.exe
 *.dll
 *.so
 *.dylib
 *.test.exe
+agent
+server
 
 # Logs
 log.txt
+*.log
+logs/
+*.out
 
 # Generated / local TLS material (do not commit private keys)
 certs/
@@ -25,7 +33,27 @@ Thumbs.db
 .vscode/
 .idea/
 
-
 # Local caches
 /data_ui/
 *.db
+
+# Node / frontend (Vite)
+web/node_modules/
+web/dist/
+web/.vite/
+web/.cache/
+web/npm-debug.log*
+web/yarn-debug.log*
+web/yarn-error.log*
+web/pnpm-debug.log*
+
+# Go build cache
+**/*.test
+coverage/
+*.coverprofile
+*.cov
+
+# Env files (keep example only)
+.env
+.env.*
+!.env.example
