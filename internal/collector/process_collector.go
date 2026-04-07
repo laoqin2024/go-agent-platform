@@ -7,15 +7,6 @@ import (
 	"time"
 )
 
-// ProcessInfo represents a single process in a platform-agnostic format.
-type ProcessInfo struct {
-	PID         uint32
-	Name        string
-	ExecPath    string
-	MemoryBytes uint64
-	CollectedAt time.Time
-}
-
 var ErrCollectUnsupported = errors.New("collector: process collection unsupported on this platform")
 
 // ProcessCollector collects a snapshot of all processes with a small in-memory cache.
@@ -25,7 +16,7 @@ type ProcessCollector struct {
 
 	mu          sync.Mutex
 	lastUpdated time.Time
-	cache       []ProcessInfo
+	cache       []ProcessStat
 }
 
 type ProcessCollectorOption func(*ProcessCollector)
@@ -49,12 +40,12 @@ func NewProcessCollector(opts ...ProcessCollectorOption) *ProcessCollector {
 }
 
 // Collect collects processes with a background context.
-func (pc *ProcessCollector) Collect() ([]ProcessInfo, error) {
+func (pc *ProcessCollector) Collect() ([]ProcessStat, error) {
 	return pc.CollectWithContext(context.Background())
 }
 
 // CollectWithContext collects a snapshot of processes, respecting ctx cancellation and using cache.
-func (pc *ProcessCollector) CollectWithContext(ctx context.Context) ([]ProcessInfo, error) {
+func (pc *ProcessCollector) CollectWithContext(ctx context.Context) ([]ProcessStat, error) {
 	if ctx == nil {
 		return nil, errors.New("collector: nil context")
 	}
@@ -63,13 +54,13 @@ func (pc *ProcessCollector) CollectWithContext(ctx context.Context) ([]ProcessIn
 	pc.mu.Lock()
 	if pc.cache != nil && now.Sub(pc.lastUpdated) < pc.cacheTTL {
 		// Return a copy to prevent callers from mutating the cached slice.
-		out := append([]ProcessInfo(nil), pc.cache...)
+		out := append([]ProcessStat(nil), pc.cache...)
 		pc.mu.Unlock()
 		return out, nil
 	}
 	pc.mu.Unlock()
 
-	procs, err := collectProcessesWithContext(ctx)
+	procs, err := collectTopProcessStatsWithContext(ctx, 100, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +72,7 @@ func (pc *ProcessCollector) CollectWithContext(ctx context.Context) ([]ProcessIn
 	pc.mu.Unlock()
 
 	// Return a copy to prevent callers from mutating the cached slice.
-	out := append([]ProcessInfo(nil), procs...)
+	out := append([]ProcessStat(nil), procs...)
 	return out, nil
 }
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,31 @@ type RedisSnapshotStore struct {
 	snapshotsKey  string // HSET agent:snapshots { device_id => snapshot_json }
 	metaKey       string // HSET agent:devices_meta { device_id => meta_json }
 	expireKeyPref string // SET agent:snapshot:exp:{device_id} 1 EXPIRE(ttl)
+	whitelistKey  string // HSET agent:risk_whitelist { device_id:proto:port => json }
+	notifySuppPref string // SETNX agent:notify_suppress:{device_id}:{vuln_key} 1 EX ttl
+}
+
+type AssetSearchHit struct {
+	DeviceID string `json:"device_id"`
+	Name     string `json:"name,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Publisher string `json:"publisher,omitempty"`
+}
+
+type SoftwareSummaryItem struct {
+	Name        string                 `json:"name"`
+	DeviceCount int                    `json:"device_count"`
+	Versions    []SoftwareVersionCount `json:"versions,omitempty"`
+}
+
+type SoftwareVersionCount struct {
+	Version     string `json:"version"`
+	DeviceCount int    `json:"device_count"`
+}
+
+type SoftwareDeviceVersionHit struct {
+	DeviceID string `json:"device_id"`
+	Version  string `json:"version,omitempty"`
 }
 
 func NewRedisSnapshotStore(client *redis.Client, ttl time.Duration) *RedisSnapshotStore {
@@ -27,6 +54,8 @@ func NewRedisSnapshotStore(client *redis.Client, ttl time.Duration) *RedisSnapsh
 		snapshotsKey:  "agent:snapshots",
 		metaKey:       "agent:devices_meta",
 		expireKeyPref: "agent:snapshot:exp:",
+		whitelistKey:  "agent:risk_whitelist",
+		notifySuppPref: "agent:notify_suppress:",
 	}
 }
 
@@ -76,6 +105,30 @@ func (s *RedisSnapshotStore) SaveSnapshot(ctx context.Context, snap model.Snapsh
 	}
 
 	meta := buildDeviceMeta(snap)
+	// Compute current critical risk from security_snapshot (even if device later goes offline, we keep the last risk state).
+	meta.HasCriticalRisk = s.hasCriticalFromSecuritySnapshotWithWhitelist(snap.DeviceID, snap.SecuritySnapshot)
+	if meta.HasCriticalRisk {
+		meta.HadCriticalRisk = true
+		if snap.UpdatedAtSec > 0 {
+			meta.LastCriticalAtSec = snap.UpdatedAtSec
+		} else {
+			meta.LastCriticalAtSec = time.Now().Unix()
+		}
+	}
+
+	// Merge with previous meta so HadCriticalRisk/LastCriticalAt are preserved even after risk is gone.
+	if prevRaw, err := s.client.HGet(ctx, s.metaKey, snap.DeviceID).Result(); err == nil && strings.TrimSpace(prevRaw) != "" {
+		var prev storedMeta
+		if json.Unmarshal([]byte(prevRaw), &prev) == nil {
+			// Preserve historical risk flags.
+			if prev.HadCriticalRisk {
+				meta.HadCriticalRisk = true
+			}
+			if meta.LastCriticalAtSec == 0 && prev.LastCriticalAtSec > 0 {
+				meta.LastCriticalAtSec = prev.LastCriticalAtSec
+			}
+		}
+	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		return err
@@ -101,6 +154,106 @@ type storedMeta struct {
 	CPUPercent   float64 `json:"cpu_percent,omitempty"`
 	MemUsedPct   float64 `json:"mem_used_percent,omitempty"`
 	UpdatedAtSec int64   `json:"updated_at,omitempty"`
+
+	// Security risk summary (persisted across updates for "offline-before-risk" marker).
+	HasCriticalRisk   bool  `json:"has_critical_risk,omitempty"`
+	HadCriticalRisk   bool  `json:"had_critical_risk,omitempty"`
+	LastCriticalAtSec int64 `json:"last_critical_at,omitempty"`
+}
+
+func hasCriticalFromSecuritySnapshot(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return false
+	}
+	listening, _ := obj["listening"].([]any)
+	if len(listening) == 0 {
+		// allow camel-case fallback
+		listening, _ = obj["Listening"].([]any)
+	}
+	for _, it := range listening {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		scope := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(m["scope"], m["Scope"]))))
+		if scope != "public" {
+			continue
+		}
+		// Prefer explicit is_high_risk; fallback to port list as compatibility.
+		if b, ok := firstNonNil(m["is_high_risk"], m["IsHighRisk"]).(bool); ok && b {
+			return true
+		}
+		p := int64(getFloatAny(firstNonNil(m["port"], m["Port"])))
+		switch p {
+		case 22, 3389, 445, 3306, 6379:
+			return true
+		}
+	}
+	return false
+}
+
+// hasCriticalFromSecuritySnapshotWithWhitelist is like hasCriticalFromSecuritySnapshot but
+// excludes ports that are whitelisted for this device.
+func (s *RedisSnapshotStore) hasCriticalFromSecuritySnapshotWithWhitelist(deviceID string, raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	entries, err := s.ListRiskWhitelist(context.Background(), deviceID)
+	if err != nil {
+		// Be conservative: ignore whitelist on error.
+		return hasCriticalFromSecuritySnapshot(raw)
+	}
+	type key struct {
+		Proto string
+		Port  uint32
+	}
+	wl := make(map[key]struct{}, len(entries))
+	for _, e := range entries {
+		wl[key{Proto: strings.ToLower(strings.TrimSpace(e.Protocol)), Port: e.Port}] = struct{}{}
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return false
+	}
+	listening, _ := obj["listening"].([]any)
+	if len(listening) == 0 {
+		listening, _ = obj["Listening"].([]any)
+	}
+	for _, it := range listening {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		scope := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(m["scope"], m["Scope"]))))
+		if scope != "public" {
+			continue
+		}
+		proto := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(m["protocol"], m["Protocol"]))))
+		if proto == "" {
+			proto = "tcp"
+		}
+		p := uint32(getFloatAny(firstNonNil(m["port"], m["Port"])))
+		if p == 0 {
+			continue
+		}
+		if _, ok := wl[key{Proto: proto, Port: p}]; ok {
+			// Whitelisted: treat as authorized, not critical.
+			continue
+		}
+		if b, ok := firstNonNil(m["is_high_risk"], m["IsHighRisk"]).(bool); ok && b {
+			return true
+		}
+		switch p {
+		case 22, 3389, 445, 3306, 6379:
+			return true
+		}
+	}
+	return false
 }
 
 func buildDeviceMeta(snap model.SnapshotPush) storedMeta {
@@ -352,6 +505,71 @@ func isPhysicalIfaceName(name string) bool {
 	return true
 }
 
+// RiskWhitelistEntry describes one whitelisted (authorized) risk endpoint per device.
+type RiskWhitelistEntry struct {
+	Protocol string `json:"protocol"` // tcp / udp
+	Port     uint32 `json:"port"`
+	Scope    string `json:"scope,omitempty"`  // public/local/other (for future extension)
+	Reason   string `json:"reason,omitempty"` // optional admin note
+	// CreatedAt is unix seconds when whitelist was created.
+	CreatedAt int64 `json:"created_at,omitempty"`
+}
+
+func (s *RedisSnapshotStore) whitelistKeyFor(deviceID, proto string, port uint32) string {
+	return deviceID + ":" + strings.ToLower(strings.TrimSpace(proto)) + ":" + strconv.FormatUint(uint64(port), 10)
+}
+
+// AddRiskWhitelist marks a specific proto/port on a device as authorized (whitelisted).
+func (s *RedisSnapshotStore) AddRiskWhitelist(ctx context.Context, deviceID string, entry RiskWhitelistEntry) error {
+	if deviceID == "" || entry.Port == 0 || entry.Protocol == "" {
+		return errors.New("invalid whitelist entry")
+	}
+	if entry.CreatedAt == 0 {
+		entry.CreatedAt = time.Now().Unix()
+	}
+	key := s.whitelistKeyFor(deviceID, entry.Protocol, entry.Port)
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	return s.client.HSet(ctx, s.whitelistKey, key, string(b)).Err()
+}
+
+// ListRiskWhitelist returns all whitelist entries for a device.
+func (s *RedisSnapshotStore) ListRiskWhitelist(ctx context.Context, deviceID string) ([]RiskWhitelistEntry, error) {
+	if deviceID == "" {
+		return nil, nil
+	}
+	// HSCAN by prefix is expensive; we keep simple HGETALL and filter by prefix, which is acceptable for small sets.
+	all, err := s.client.HGetAll(ctx, s.whitelistKey).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	prefix := deviceID + ":"
+	out := make([]RiskWhitelistEntry, 0, len(all))
+	for k, v := range all {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		var e RiskWhitelistEntry
+		if err := json.Unmarshal([]byte(v), &e); err != nil {
+			continue
+		}
+		if e.Protocol == "" || e.Port == 0 {
+			continue
+		}
+		out = append(out, e)
+	}
+	// Stable order: protocol, port
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Protocol != out[j].Protocol {
+			return out[i].Protocol < out[j].Protocol
+		}
+		return out[i].Port < out[j].Port
+	})
+	return out, nil
+}
+
 func firstNonNil(a, b any) any {
 	if a != nil {
 		return a
@@ -532,6 +750,9 @@ func (s *RedisSnapshotStore) ListDevices(ctx context.Context, onlineWithin time.
 					if meta.MemUsedPct > 0 {
 						info.MemUsedPct = meta.MemUsedPct
 					}
+					info.HasCriticalRisk = meta.HasCriticalRisk
+					info.HadCriticalRisk = meta.HadCriticalRisk
+					info.LastCriticalAtSec = meta.LastCriticalAtSec
 					if meta.UpdatedAtSec > 0 {
 						updatedAt = meta.UpdatedAtSec
 						info.UpdatedAtSec = meta.UpdatedAtSec
@@ -592,6 +813,9 @@ func (s *RedisSnapshotStore) ListDevices(ctx context.Context, onlineWithin time.
 						CPUPercent:   info.CPUPercent,
 						MemUsedPct:   info.MemUsedPct,
 						UpdatedAtSec: info.UpdatedAtSec,
+						HasCriticalRisk:   info.HasCriticalRisk,
+						HadCriticalRisk:   info.HadCriticalRisk,
+						LastCriticalAtSec: info.LastCriticalAtSec,
 					}
 					if b, err := json.Marshal(merged); err == nil {
 						_, _ = s.client.HSet(ctx, s.metaKey, id, string(b)).Result()
@@ -608,6 +832,322 @@ func (s *RedisSnapshotStore) ListDevices(ctx context.Context, onlineWithin time.
 
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].UpdatedAtSec > out[j].UpdatedAtSec
+	})
+	return out, nil
+}
+
+// SearchSoftwareAssets searches software records across all active device snapshots.
+// It checks software_list first, then falls back to software_inventory/items.
+func (s *RedisSnapshotStore) SearchSoftwareAssets(ctx context.Context, keyword string) ([]AssetSearchHit, error) {
+	kw := strings.ToLower(strings.TrimSpace(keyword))
+	if kw == "" {
+		return []AssetSearchHit{}, nil
+	}
+
+	ids, err := s.ListDeviceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return []AssetSearchHit{}, nil
+	}
+
+	vals, err := s.client.HMGet(ctx, s.snapshotsKey, ids...).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	hits := make([]AssetSearchHit, 0, 64)
+	seen := make(map[string]struct{}, 128)
+	for i, id := range ids {
+		if i >= len(vals) || vals[i] == nil {
+			continue
+		}
+		raw, ok := vals[i].(string)
+		if !ok || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		var snap storedSnapshot
+		if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+			continue
+		}
+
+		items := extractSoftwareItemsForSearch(snap)
+		for _, it := range items {
+			name := strings.TrimSpace(getStringAny(firstNonNil(it["name"], it["Name"])))
+			version := strings.TrimSpace(getStringAny(firstNonNil(it["version"], it["Version"])))
+			publisherAny := firstNonNil(
+				firstNonNil(it["publisher"], it["Publisher"]),
+				firstNonNil(firstNonNil(it["vendor"], it["Vendor"]), firstNonNil(it["maintainer"], it["Maintainer"])),
+			)
+			publisher := strings.TrimSpace(getStringAny(publisherAny))
+			if name == "" {
+				continue
+			}
+			text := strings.ToLower(name + " " + publisher)
+			if !strings.Contains(text, kw) {
+				continue
+			}
+			k := id + "|" + strings.ToLower(name) + "|" + version + "|" + strings.ToLower(publisher)
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			hits = append(hits, AssetSearchHit{
+				DeviceID:  id,
+				Name:      name,
+				Version:   version,
+				Publisher: publisher,
+			})
+		}
+	}
+
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].DeviceID != hits[j].DeviceID {
+			return hits[i].DeviceID < hits[j].DeviceID
+		}
+		if hits[i].Name != hits[j].Name {
+			return hits[i].Name < hits[j].Name
+		}
+		return hits[i].Version < hits[j].Version
+	})
+	return hits, nil
+}
+
+func extractSoftwareItemsForSearch(snap storedSnapshot) []map[string]any {
+	// 1) software_list (preferred)
+	if arr := parseSoftwareArrayRaw(snap.SoftwareList); len(arr) > 0 {
+		return arr
+	}
+	// 2) software_inventory
+	if arr := parseSoftwareArrayRaw(snap.SoftwareInventory); len(arr) > 0 {
+		return arr
+	}
+	// 3) host_metrics.software_list fallback
+	if len(snap.HostMetrics) > 0 {
+		var hm map[string]any
+		if json.Unmarshal(snap.HostMetrics, &hm) == nil {
+			if arr := parseSoftwareArrayAny(firstNonNil(firstNonNil(hm["software_list"], hm["SoftwareList"]), hm["softwareList"])); len(arr) > 0 {
+				return arr
+			}
+		}
+	}
+	return nil
+}
+
+func parseSoftwareArrayRaw(raw json.RawMessage) []map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	return parseSoftwareArrayAny(obj)
+}
+
+func parseSoftwareArrayAny(v any) []map[string]any {
+	switch t := v.(type) {
+	case []any:
+		out := make([]map[string]any, 0, len(t))
+		for _, it := range t {
+			if m, ok := it.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	case map[string]any:
+		for _, k := range []string{"items", "Items", "software_list", "softwareList", "software", "Software"} {
+			if vv, ok := t[k]; ok {
+				if arr := parseSoftwareArrayAny(vv); len(arr) > 0 {
+					return arr
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// TryAcquireNotifyWindow returns true if notify should be sent now, false if suppressed.
+// It uses Redis SETNX with EX ttl for cross-instance suppression.
+func (s *RedisSnapshotStore) TryAcquireNotifyWindow(ctx context.Context, deviceID, vulnerabilityKey string, ttl time.Duration) (bool, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	vulnerabilityKey = strings.ToLower(strings.TrimSpace(vulnerabilityKey))
+	if deviceID == "" || vulnerabilityKey == "" {
+		return false, errors.New("empty device_id or vulnerability_key")
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	key := fmt.Sprintf("%s%s:%s", s.notifySuppPref, deviceID, vulnerabilityKey)
+	ok, err := s.client.SetNX(ctx, key, "1", ttl).Result()
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+func (s *RedisSnapshotStore) listOnlineDeviceIDs(ctx context.Context, onlineWithin time.Duration) ([]string, error) {
+	devices, err := s.ListDevices(ctx, onlineWithin)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(devices))
+	for _, d := range devices {
+		if d.Online {
+			ids = append(ids, d.DeviceID)
+		}
+	}
+	return ids, nil
+}
+
+func (s *RedisSnapshotStore) listSoftwareItemsByDeviceIDs(ctx context.Context, ids []string) (map[string][]map[string]any, error) {
+	if len(ids) == 0 {
+		return map[string][]map[string]any{}, nil
+	}
+	vals, err := s.client.HMGet(ctx, s.snapshotsKey, ids...).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	out := make(map[string][]map[string]any, len(ids))
+	for i, id := range ids {
+		if i >= len(vals) || vals[i] == nil {
+			continue
+		}
+		raw, ok := vals[i].(string)
+		if !ok || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		var snap storedSnapshot
+		if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+			continue
+		}
+		items := extractSoftwareItemsForSearch(snap)
+		if len(items) > 0 {
+			out[id] = items
+		}
+	}
+	return out, nil
+}
+
+// SoftwareSummary counts software installation by name across online devices.
+// It returns top-N software by install count plus version distribution.
+func (s *RedisSnapshotStore) SoftwareSummary(ctx context.Context, onlineWithin time.Duration, topN int) ([]SoftwareSummaryItem, error) {
+	ids, err := s.listOnlineDeviceIDs(ctx, onlineWithin)
+	if err != nil {
+		return nil, err
+	}
+	byDevice, err := s.listSoftwareItemsByDeviceIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	type agg struct {
+		display     string
+		count       int
+		versionSeen map[string]map[string]struct{} // version => set(deviceID)
+	}
+	bucket := make(map[string]*agg, 128)
+	for deviceID, items := range byDevice {
+		perDeviceSeen := make(map[string]struct{}, 64)
+		perDeviceVersionSeen := make(map[string]map[string]struct{}, 64)
+		for _, it := range items {
+			name := strings.TrimSpace(getStringAny(firstNonNil(it["name"], it["Name"])))
+			version := strings.TrimSpace(getStringAny(firstNonNil(it["version"], it["Version"])))
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			perDeviceSeen[key] = struct{}{}
+			if _, ok := perDeviceVersionSeen[key]; !ok {
+				perDeviceVersionSeen[key] = make(map[string]struct{}, 4)
+			}
+			perDeviceVersionSeen[key][version] = struct{}{}
+			if _, ok := bucket[key]; !ok {
+				bucket[key] = &agg{
+					display:     name,
+					versionSeen: make(map[string]map[string]struct{}, 8),
+				}
+			}
+		}
+		for key := range perDeviceSeen {
+			bucket[key].count++
+		}
+		for key, versions := range perDeviceVersionSeen {
+			for version := range versions {
+				if _, ok := bucket[key].versionSeen[version]; !ok {
+					bucket[key].versionSeen[version] = make(map[string]struct{}, 8)
+				}
+				bucket[key].versionSeen[version][deviceID] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]SoftwareSummaryItem, 0, len(bucket))
+	for _, v := range bucket {
+		versions := make([]SoftwareVersionCount, 0, len(v.versionSeen))
+		for ver, devSet := range v.versionSeen {
+			versions = append(versions, SoftwareVersionCount{
+				Version:     ver,
+				DeviceCount: len(devSet),
+			})
+		}
+		sort.Slice(versions, func(i, j int) bool {
+			if versions[i].DeviceCount != versions[j].DeviceCount {
+				return versions[i].DeviceCount > versions[j].DeviceCount
+			}
+			return versions[i].Version < versions[j].Version
+		})
+		out = append(out, SoftwareSummaryItem{Name: v.display, DeviceCount: v.count, Versions: versions})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DeviceCount != out[j].DeviceCount {
+			return out[i].DeviceCount > out[j].DeviceCount
+		}
+		return out[i].Name < out[j].Name
+	})
+	if topN > 0 && len(out) > topN {
+		out = out[:topN]
+	}
+	return out, nil
+}
+
+// FindSoftwareDevices finds online device IDs + version that have software name matching keyword.
+func (s *RedisSnapshotStore) FindSoftwareDevices(ctx context.Context, keyword string, onlineWithin time.Duration) ([]SoftwareDeviceVersionHit, error) {
+	kw := strings.ToLower(strings.TrimSpace(keyword))
+	if kw == "" {
+		return []SoftwareDeviceVersionHit{}, nil
+	}
+	ids, err := s.listOnlineDeviceIDs(ctx, onlineWithin)
+	if err != nil {
+		return nil, err
+	}
+	byDevice, err := s.listSoftwareItemsByDeviceIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]SoftwareDeviceVersionHit, 0, len(byDevice))
+	seen := make(map[string]struct{}, len(byDevice)*2)
+	for id, items := range byDevice {
+		for _, it := range items {
+			name := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(it["name"], it["Name"]))))
+			version := strings.TrimSpace(getStringAny(firstNonNil(it["version"], it["Version"])))
+			if name != "" && strings.Contains(name, kw) {
+				k := id + "|" + strings.ToLower(version)
+				if _, ok := seen[k]; ok {
+					continue
+				}
+				seen[k] = struct{}{}
+				out = append(out, SoftwareDeviceVersionHit{DeviceID: id, Version: version})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DeviceID != out[j].DeviceID {
+			return out[i].DeviceID < out[j].DeviceID
+		}
+		return out[i].Version < out[j].Version
 	})
 	return out, nil
 }

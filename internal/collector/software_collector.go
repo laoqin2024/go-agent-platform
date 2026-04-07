@@ -1,10 +1,14 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // SoftwareInfo represents an installed application in a platform-agnostic format.
@@ -67,6 +71,12 @@ func (sc *SoftwareCollector) Collect(ctx context.Context) ([]SoftwareInfo, error
 		return nil, err
 	}
 
+	// Data cleaning (security hardening):
+	// - Force valid UTF-8 (drop invalid sequences)
+	// - Remove control characters to avoid UI/log corruption
+	// - Trim and drop empty names
+	items = cleanSoftwareInfos(items)
+
 	// Stamp collected time.
 	for i := range items {
 		items[i].CollectedAt = now
@@ -81,3 +91,52 @@ func (sc *SoftwareCollector) Collect(ctx context.Context) ([]SoftwareInfo, error
 	return out, nil
 }
 
+func cleanSoftwareInfos(in []SoftwareInfo) []SoftwareInfo {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SoftwareInfo, 0, len(in))
+	for _, it := range in {
+		it.Name = cleanSoftwareString(it.Name)
+		it.Version = cleanSoftwareString(it.Version)
+		it.Publisher = cleanSoftwareString(it.Publisher)
+
+		if strings.TrimSpace(it.Name) == "" {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+func cleanSoftwareString(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	// Force valid UTF-8; drop invalid byte sequences.
+	if !utf8.ValidString(s) {
+		s = string(bytes.ToValidUTF8([]byte(s), nil))
+	}
+
+	// Remove control characters (keep common whitespace).
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		// Remove explicit replacement chars often produced by broken encodings.
+		if r == unicode.ReplacementChar {
+			return -1
+		}
+		return r
+	}, s)
+
+	// Normalize whitespace a bit.
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.TrimSpace(s)
+}

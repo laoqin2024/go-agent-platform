@@ -1,0 +1,475 @@
+basePath: /api/v1
+definitions:
+  collector.CPUStats:
+    properties:
+      total:
+        description: Total is the overall CPU utilization percent (0-100).
+        format: float64
+        type: number
+    type: object
+  collector.DiskIOStats:
+    properties:
+      device_name:
+        type: string
+      read_iops:
+        type: number
+      read_kbps:
+        type: number
+      util_percent:
+        type: number
+      write_iops:
+        type: number
+      write_kbps:
+        type: number
+    type: object
+  collector.DiskStats:
+    properties:
+      free:
+        format: int64
+        type: integer
+      path:
+        type: string
+      total:
+        format: int64
+        type: integer
+      used:
+        format: int64
+        type: integer
+      usedPercent:
+        format: float64
+        type: number
+    type: object
+  collector.GpuStat:
+    properties:
+      memory_total_mb:
+        type: number
+      memory_used_mb:
+        type: number
+      model:
+        type: string
+      temperature:
+        type: number
+      util_percent:
+        type: number
+    type: object
+  collector.HostMetrics:
+    properties:
+      collectedAt:
+        type: string
+      cpu:
+        $ref: '#/definitions/collector.CPUStats'
+      disk:
+        $ref: '#/definitions/collector.DiskStats'
+      disk_io:
+        description: |-
+          DiskIO contains per-device I/O performance metrics derived from gopsutil
+          disk.IOCounters deltas between collection intervals.
+        items:
+          $ref: '#/definitions/collector.DiskIOStats'
+        type: array
+      fingerprint:
+        type: string
+      gpu_stats:
+        description: GpuStats provides per-GPU realtime telemetry (best-effort).
+        items:
+          $ref: '#/definitions/collector.GpuStat'
+        type: array
+      hostname:
+        type: string
+      memory:
+        $ref: '#/definitions/collector.MemoryStats'
+      network:
+        $ref: '#/definitions/collector.NetworkStats'
+      network_interfaces:
+        description: network_interfaces provides per-active-NIC counters for deeper
+          monitoring.
+        items:
+          $ref: '#/definitions/collector.NetworkInterfaceStats'
+        type: array
+      ping_latency_ms:
+        description: PingLatencyMs is the best-effort baseline RTT (ms) against configured
+          targets.
+        type: integer
+      processes:
+        description: Processes contains a best-effort Top-N process insight snapshot
+          (for UI).
+        items:
+          $ref: '#/definitions/collector.ProcessStat'
+        type: array
+      security_snapshot:
+        allOf:
+        - $ref: '#/definitions/collector.SecuritySnapshot'
+        description: SecuritySnapshot contains best-effort host security telemetry
+          (e.g., listening ports).
+      services:
+        description: Services contains a best-effort service health snapshot (failed
+          + whitelist only).
+        items:
+          $ref: '#/definitions/collector.ServiceStat'
+        type: array
+    type: object
+  collector.HotfixInfo:
+    properties:
+      installed_at:
+        type: string
+      kb:
+        type: string
+    type: object
+  collector.ListeningPort:
+    properties:
+      address:
+        description: 'e.g. 0.0.0.0 / 127.0.0.1 / ::'
+        type: string
+      is_high_risk:
+        description: IsHighRisk is true when a high-risk port (22, 3389, 445, 3306)
+          is exposed on a public address (0.0.0.0/::).
+        type: boolean
+      port:
+        type: integer
+      protocol:
+        description: tcp / udp
+        type: string
+      scope:
+        description: 'Scope: public (0.0.0.0/::), local (127.0.0.1/::1), private/other
+          best-effort classification'
+        type: string
+    type: object
+  collector.MemoryStats:
+    properties:
+      total:
+        format: int64
+        type: integer
+      used:
+        format: int64
+        type: integer
+      usedPercent:
+        format: float64
+        type: number
+    type: object
+  collector.NetConnInfo:
+    properties:
+      local_addr:
+        type: string
+      local_port:
+        type: integer
+      pid:
+        type: integer
+      process_name:
+        type: string
+      protocol:
+        type: string
+      remote_addr:
+        type: string
+      remote_port:
+        type: integer
+      state:
+        description: LISTEN / ESTABLISHED
+        type: string
+    type: object
+  collector.NetworkInterfaceStats:
+    properties:
+      bytes_recv:
+        type: integer
+      bytes_sent:
+        type: integer
+      drop_in:
+        type: integer
+      drop_out:
+        type: integer
+      errors_in:
+        type: integer
+      errors_out:
+        type: integer
+      name:
+        type: string
+      packets_recv:
+        type: integer
+      packets_sent:
+        type: integer
+    type: object
+  collector.NetworkStats:
+    properties:
+      bytesRecv:
+        description: Cumulative bytes since system boot (or last reset depending on
+          OS semantics).
+        format: int64
+        type: integer
+      bytesSent:
+        format: int64
+        type: integer
+    type: object
+  collector.ProcessStat:
+    properties:
+      cgroup:
+        description: CGroup is a best-effort cgroup path (Linux) used to keep service
+          mapping stable across PID changes.
+        type: string
+      collected_at:
+        type: string
+      cpu_percent:
+        description: CPUPercent is the best-effort CPU usage percentage.
+        type: number
+      exec_path:
+        type: string
+      listening_ports:
+        items:
+          type: integer
+        type: array
+      memory_bytes:
+        description: MemoryBytes keeps backwards compatibility with existing UI fields.
+        type: integer
+      memory_mb:
+        description: MemoryMB is the best-effort resident memory usage (MB).
+        type: number
+      name:
+        type: string
+      pid:
+        type: integer
+      service_name:
+        description: ServiceName is a best-effort owning service label (systemd/launchd/Windows
+          service).
+        type: string
+      status:
+        description: Status is a best-effort running state string (e.g., running/sleeping).
+        type: string
+      uptime_sec:
+        description: UptimeSec is seconds since process creation time.
+        type: integer
+      username:
+        type: string
+    type: object
+  collector.SecuritySnapshot:
+    properties:
+      collected_at:
+        type: string
+      connections:
+        items:
+          $ref: '#/definitions/collector.NetConnInfo'
+        type: array
+      hotfixes:
+        items:
+          $ref: '#/definitions/collector.HotfixInfo'
+        type: array
+      listening:
+        items:
+          $ref: '#/definitions/collector.ListeningPort'
+        type: array
+      startup:
+        items:
+          $ref: '#/definitions/collector.StartupItem'
+        type: array
+    type: object
+  collector.ServiceStat:
+    properties:
+      container_count:
+        description: 'ContainerCount is best-effort (Docker service): number of containers
+          (usually running) on this host.'
+        type: integer
+      exit_code:
+        type: integer
+      name:
+        type: string
+      restart_count:
+        type: integer
+      start_type:
+        description: 'StartType is best-effort (Windows): auto/manual/disabled'
+        type: string
+      status:
+        description: 'Status is best-effort: Active/Inactive/Failed/Running/Stopped...'
+        type: string
+      uptime_sec:
+        type: integer
+    type: object
+  collector.StartupItem:
+    properties:
+      command:
+        type: string
+      location:
+        type: string
+      name:
+        type: string
+    type: object
+  handler.ApiBatchItem:
+    properties:
+      dataType:
+        type: string
+      host_metrics:
+        allOf:
+        - $ref: '#/definitions/collector.HostMetrics'
+        description: 'Optional typed hints for Swagger model expansion:'
+      payload:
+        additionalProperties: {}
+        type: object
+      security_snapshot:
+        $ref: '#/definitions/collector.SecuritySnapshot'
+    type: object
+  handler.ApiBatchRequest:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/handler.ApiBatchItem'
+        type: array
+    type: object
+  handler.DeviceSnapshotResponse:
+    properties:
+      device_id:
+        type: string
+      hardware_details:
+        additionalProperties: {}
+        type: object
+      host_metrics:
+        $ref: '#/definitions/collector.HostMetrics'
+      network_connections:
+        items:
+          additionalProperties: {}
+          type: object
+        type: array
+      process_snapshot:
+        additionalProperties: {}
+        type: object
+      processes:
+        items:
+          $ref: '#/definitions/collector.ProcessStat'
+        type: array
+      security_snapshot:
+        additionalProperties: {}
+        type: object
+      service_snapshot:
+        items:
+          $ref: '#/definitions/collector.ServiceStat'
+        type: array
+      software_inventory:
+        items:
+          additionalProperties: {}
+          type: object
+        type: array
+      software_list:
+        items:
+          additionalProperties: {}
+          type: object
+        type: array
+      updated_at:
+        type: integer
+    type: object
+  main.ApiBatchRequest:
+    type: object
+host: localhost:8080
+info:
+  contact:
+    name: 开发团队
+  description: 高并发 Agent 采集与实时监控数据上报系统
+  title: 2000台规模设备监控平台 API
+  version: "1.0"
+paths:
+  /device/{device_id}/snapshot:
+    get:
+      parameters:
+      - description: 设备唯一指纹
+        in: path
+        name: device_id
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.DeviceSnapshotResponse'
+        "400":
+          description: '{"error":"device_id is required"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: '{"error":"snapshot not found"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: '{"error":"redis load failed"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: 获取设备详情
+  /ingest:
+    post:
+      consumes:
+      - application/json
+      description: 接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务、网络连接与安全快照（当在公开地址上暴露高危端口 22/3389/445/3306
+        时，listening 项将返回 is_high_risk=true）
+      parameters:
+      - description: 必须为 gzip
+        in: header
+        name: Content-Encoding
+        required: true
+        type: string
+      - description: 指标数据包（包含 security_snapshot.listening 的 is_high_risk 标志）
+        in: body
+        name: payload
+        required: true
+        schema:
+          $ref: '#/definitions/main.ApiBatchRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{"status":"ok"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: '{"error":"invalid JSON"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: '{"error":"payload too large"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: 上报设备指标
+  /report:
+    post:
+      consumes:
+      - application/json
+      description: 接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务和网络连接
+      parameters:
+      - description: 必须为 gzip
+        in: header
+        name: Content-Encoding
+        required: true
+        type: string
+      - description: 指标数据包（批量 items 列表，含 host_metrics/security_snapshot）
+        in: body
+        name: payload
+        required: true
+        schema:
+          $ref: '#/definitions/handler.ApiBatchRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: '{"status":"ok"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: '{"error":"invalid JSON"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: '{"error":"payload too large"}'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: 上报设备指标
+swagger: "2.0"

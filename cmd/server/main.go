@@ -7,14 +7,23 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/qinyilin/go-agent/internal/server/handler"
+	"github.com/qinyilin/go-agent/internal/server/notify"
 	"github.com/qinyilin/go-agent/internal/server/router"
 	"github.com/qinyilin/go-agent/internal/server/store"
 	"github.com/qinyilin/go-agent/internal/server/ws"
 )
+
+// @title           2000台规模设备监控平台 API
+// @version         1.0
+// @description     高并发 Agent 采集与实时监控数据上报系统
+// @contact.name    开发团队
+// @host            localhost:8080
+// @BasePath        /api/v1
 
 func main() {
 	var (
@@ -41,16 +50,31 @@ func main() {
 	snapshotStore := store.NewRedisSnapshotStore(redisClient, *redisTTL)
 
 	wsHub := ws.NewHub()
+	controlHub := ws.NewControlHub()
+	var notifierPlugin notify.Notifier
+	if webhookURL := strings.TrimSpace(os.Getenv("NOTIFY_WEBHOOK_URL")); webhookURL != "" {
+		if n, err := notify.NewWebhookNotifier(webhookURL); err == nil {
+			notifierPlugin = n
+		} else {
+			logger.Warn("failed to init webhook notifier", "err", err)
+		}
+	}
 	reportHandler := handler.NewReportHandler(snapshotStore, wsHub, logger)
 	wsHandler := handler.NewWSHandler(snapshotStore, wsHub, logger)
+	controlHandler := handler.NewControlHandler(controlHub, logger, notifierPlugin, snapshotStore)
 	snapshotHandler := handler.NewDeviceSnapshotHandler(snapshotStore, logger)
 	devicesHandler := handler.NewDevicesHandler(snapshotStore)
+	riskWhitelistHandler := handler.NewRiskWhitelistHandler(snapshotStore)
+	assetsSearchHandler := handler.NewAssetsSearchHandler(snapshotStore)
 
 	r := router.NewRouter(router.RouterConfig{
-		ReportHandler:   reportHandler,
-		WSHandler:       wsHandler,
-		SnapshotHandler: snapshotHandler,
-		DevicesHandler:  devicesHandler,
+		ReportHandler:        reportHandler,
+		WSHandler:            wsHandler,
+		ControlHandler:       controlHandler,
+		SnapshotHandler:      snapshotHandler,
+		DevicesHandler:       devicesHandler,
+		RiskWhitelistHandler: riskWhitelistHandler,
+		AssetsSearchHandler:  assetsSearchHandler,
 	})
 
 	httpServer := &http.Server{

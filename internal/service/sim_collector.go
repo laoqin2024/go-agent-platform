@@ -39,6 +39,9 @@ type SimCollector struct {
 	processSnapshotRunning bool
 	lastProcessHashMu      sync.Mutex
 	lastProcessHash        string
+	// Data-diff for software inventory
+	lastSoftwareHashMu sync.Mutex
+	lastSoftwareHash   string
 
 	serviceSnapshotMu      sync.Mutex
 	serviceSnapshotRunning bool
@@ -235,14 +238,37 @@ func (c *SimCollector) triggerSoftwareScan(ctx context.Context, reason string) {
 				Fingerprint string                 `json:"fingerprint,omitempty"`
 				Items       []collector.SoftwareInfo `json:"items"`
 			}
-			payload, err := json.Marshal(softwareInventoryPayload{Fingerprint: fp, Items: apps})
+			full := softwareInventoryPayload{Fingerprint: fp, Items: apps}
+			payload, err := json.Marshal(full)
 			if err != nil {
 				c.logger.Warn("collection engine: failed to marshal software inventory", "err", err)
 				return
 			}
-			if err := c.buffer.Save("software_inventory", payload); err != nil {
-				c.logger.Warn("collection engine: failed to buffer software inventory", "err", err)
-				return
+			h := hashBytes(payload)
+			// Compare with last hash to optionally send a tiny no_change marker
+			c.lastSoftwareHashMu.Lock()
+			same := (h != "" && h == c.lastSoftwareHash)
+			if !same {
+				c.lastSoftwareHash = h
+			}
+			c.lastSoftwareHashMu.Unlock()
+			if same {
+				// Send a tiny diff marker so backend may reuse last version
+				diffPayload, _ := json.Marshal(struct {
+					Fingerprint string `json:"fingerprint,omitempty"`
+					Status      string `json:"status"`
+					Hash        string `json:"hash,omitempty"`
+					Reason      string `json:"reason,omitempty"`
+				}{Fingerprint: fp, Status: "no_change", Hash: h, Reason: reason})
+				if err := c.buffer.Save("software_inventory", diffPayload); err != nil {
+					c.logger.Warn("collection engine: failed to buffer software_inventory no_change", "err", err)
+					return
+				}
+			} else {
+				if err := c.buffer.Save("software_inventory", payload); err != nil {
+					c.logger.Warn("collection engine: failed to buffer software inventory", "err", err)
+					return
+				}
 			}
 		}
 		if len(apps) == 0 {
@@ -392,7 +418,7 @@ func (c *SimCollector) triggerProcessAndServiceSnapshots(ctx context.Context, re
 			return
 		}
 
-		// Optional perf protection: if full snapshot unchanged, skip buffering.
+		// Optional perf protection: if full snapshot unchanged, send tiny no_change marker.
 		h := hashBytes(payload)
 		c.lastProcessHashMu.Lock()
 		same := (h != "" && h == c.lastProcessHash)
@@ -401,11 +427,43 @@ func (c *SimCollector) triggerProcessAndServiceSnapshots(ctx context.Context, re
 		}
 		c.lastProcessHashMu.Unlock()
 		if same {
-			c.logger.Info("collection engine: process snapshot unchanged; skipped buffering", "reason", reason)
+			// Ensure fingerprint present even for no_change markers.
+			fp := ""
+			if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+				fp = hw.Fingerprint
+			}
+			diffPayload, _ := json.Marshal(struct {
+				Fingerprint string `json:"fingerprint,omitempty"`
+				Status      string `json:"status"`
+				Hash        string `json:"hash,omitempty"`
+				Note        string `json:"note,omitempty"`
+			}{Fingerprint: fp, Status: "no_change", Hash: h, Note: reason})
+			if err := c.buffer.Save("process_snapshot", diffPayload); err != nil {
+				c.logger.Warn("collection engine: failed to buffer process_snapshot no_change", "err", err)
+			} else {
+				c.logger.Info("collection engine: process snapshot unchanged; buffered no_change", "reason", reason)
+			}
 			return
 		}
 
-		if err := c.buffer.Save("process_snapshot", payload); err != nil {
+		// Attach fingerprint to process_snapshot payload.
+		fp := ""
+		if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+			fp = hw.Fingerprint
+		}
+		type processSnapshotWithFP struct {
+			Fingerprint string                  `json:"fingerprint,omitempty"`
+			Processes   []collector.ProcessInfo `json:"processes"`
+			Services    []collector.ServiceInfo `json:"services"`
+			CollectedAt time.Time               `json:"collected_at"`
+		}
+		fpPayload, _ := json.Marshal(processSnapshotWithFP{
+			Fingerprint: fp,
+			Processes:   snap.Processes,
+			Services:    snap.Services,
+			CollectedAt: snap.CollectedAt,
+		})
+		if err := c.buffer.Save("process_snapshot", fpPayload); err != nil {
 			c.logger.Warn("collection engine: failed to buffer process snapshot", "err", err)
 			return
 		}
@@ -417,10 +475,18 @@ func (c *SimCollector) triggerProcessAndServiceSnapshots(ctx context.Context, re
 		)
 
 		// Buffer services only as service_snapshot for T2 consumers.
-		svcPayload, err := json.Marshal(struct {
+		// Also include fingerprint for service_snapshot.
+		type serviceSnapshotWithFP struct {
+			Fingerprint string                  `json:"fingerprint,omitempty"`
 			Services    []collector.ServiceInfo `json:"services"`
 			CollectedAt time.Time               `json:"collected_at"`
-		}{
+		}
+		fpSvc := ""
+		if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+			fpSvc = hw.Fingerprint
+		}
+		svcPayload, err := json.Marshal(serviceSnapshotWithFP{
+			Fingerprint: fpSvc,
 			Services:    snap.Services,
 			CollectedAt: snap.CollectedAt,
 		})
@@ -461,7 +527,21 @@ func (c *SimCollector) triggerNetworkConnections(ctx context.Context, reason str
 		if c.buffer == nil {
 			return
 		}
-		payload, err := json.Marshal(snap)
+		// Include fingerprint for network_connections
+		fp := ""
+		if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+			fp = hw.Fingerprint
+		}
+		type netConnsWithFP struct {
+			Fingerprint string                      `json:"fingerprint,omitempty"`
+			Connections []collector.NetConnInfo     `json:"connections"`
+			CollectedAt time.Time                   `json:"collected_at"`
+		}
+		payload, err := json.Marshal(netConnsWithFP{
+			Fingerprint: fp,
+			Connections: snap.Connections,
+			CollectedAt: snap.CollectedAt,
+		})
 		if err != nil {
 			c.logger.Warn("collection engine: failed to marshal network connections", "err", err)
 			return
@@ -496,7 +576,32 @@ func (c *SimCollector) triggerSecurityScan(ctx context.Context, reason string) {
 			return
 		}
 		if c.buffer != nil {
-			payload, err := json.Marshal(snap)
+			// Include fingerprint for security_snapshot
+			fp := ""
+			if hw, err := c.hardware.CollectWithContext(ctx); err == nil {
+				fp = hw.Fingerprint
+			}
+			type securityWithFP struct {
+				Fingerprint string               `json:"fingerprint,omitempty"`
+				SecuritySnapshot collector.SecuritySnapshot `json:"-"`
+				Connections []collector.NetConnInfo  `json:"connections"`
+				Startup     []collector.StartupItem  `json:"startup"`
+				Hotfixes    []collector.HotfixInfo   `json:"hotfixes"`
+				CollectedAt time.Time                `json:"collected_at"`
+			}
+			payload, err := json.Marshal(struct {
+				Fingerprint string                   `json:"fingerprint,omitempty"`
+				Connections []collector.NetConnInfo  `json:"connections"`
+				Startup     []collector.StartupItem  `json:"startup"`
+				Hotfixes    []collector.HotfixInfo   `json:"hotfixes"`
+				CollectedAt time.Time                `json:"collected_at"`
+			}{
+				Fingerprint: fp,
+				Connections: snap.Connections,
+				Startup:     snap.Startup,
+				Hotfixes:    snap.Hotfixes,
+				CollectedAt: snap.CollectedAt,
+			})
 			if err != nil {
 				c.logger.Warn("collection engine: failed to marshal security snapshot", "err", err)
 				return

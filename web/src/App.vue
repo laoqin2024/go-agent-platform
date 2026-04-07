@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import DeviceList from "./components/DeviceList.vue";
 import DeviceDetail from "./components/DeviceDetail.vue";
+import AssetsHub from "./views/AssetsHub.vue";
 import { request } from "./utils/request";
 import { useWebSocket, type WSConnectionStatus } from "./composables/useWebSocket";
 
@@ -16,6 +18,9 @@ type DeviceInfo = {
   mem_used_percent?: number;
   updated_at?: number;
   online?: boolean;
+  has_critical_risk?: boolean;
+  had_critical_risk?: boolean;
+  last_critical_at?: number;
 };
 
 type CurrentDevice = {
@@ -34,15 +39,19 @@ type CurrentDevice = {
   wsReceived: boolean;
 };
 
-const seedDevices: DeviceInfo[] = [
-  { device_id: "demo-fingerprint-00000000", hostname: "Demo", os: "", updated_at: 0, online: false },
-];
-const devices = ref<DeviceInfo[]>(seedDevices);
-const selectedDeviceId = ref<string>(seedDevices[0]?.device_id ?? "");
+const devices = ref<DeviceInfo[]>([]);
+const route = useRoute();
+const router = useRouter();
+const isAssetsView = computed(() => route.path.startsWith("/assets"));
+const selectedDeviceId = ref<string>("");
 const userSelected = ref(false);
 
+// Active device reference (required by detail pane)
+const activeId = selectedDeviceId;
+const activeDevice = computed(() => devices.value.find((d) => d.device_id === activeId.value));
+
 const currentDevice = reactive<CurrentDevice>({
-  deviceId: selectedDeviceId.value,
+  deviceId: selectedDeviceId.value || "",
   processes: [],
   softwareList: [],
   hostMetrics: null,
@@ -59,7 +68,24 @@ const currentDevice = reactive<CurrentDevice>({
 
 let seq = 0;
 let metricsTick: number | null = null;
+let deviceOnlineTick: number | null = null;
 const lastHostMetricsAtMs = ref<number>(0);
+const DEVICE_ONLINE_DOT_TIMEOUT_SEC = 60; // 心跳超过此阈值：左侧列表绿色点变为离线
+let wsGlobal: WebSocket | null = null;
+const lastUpdateTrigger = ref(0);
+
+function syncDeviceOnlineDots() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (const d of devices.value) {
+    const t = typeof d.updated_at === "number" ? d.updated_at : 0;
+    if (!t || t <= 0) {
+      d.online = false;
+      continue;
+    }
+    const ageSec = nowSec - t;
+    d.online = ageSec >= 0 && ageSec < DEVICE_ONLINE_DOT_TIMEOUT_SEC;
+  }
+}
 
 function firstProcFeature(arr: any[]) {
   const p = arr?.[0];
@@ -150,6 +176,20 @@ function updateDeviceMetaFromPayload(deviceId: string, payload: any) {
   devices.value[idx] = next;
 }
 
+function hasCriticalFromSecuritySnapshotObj(ss: any): boolean {
+  if (!ss || typeof ss !== "object") return false;
+  const arr = Array.isArray(ss?.listening) ? ss.listening : Array.isArray(ss?.Listening) ? ss.Listening : [];
+  for (const it of arr) {
+    const scope = String(it?.scope ?? it?.Scope ?? "").toLowerCase();
+    if (scope !== "public") continue;
+    const isHigh = !!(it?.is_high_risk ?? it?.IsHighRisk);
+    if (isHigh) return true;
+    const port = Number(it?.port ?? it?.Port ?? 0);
+    if ([22, 3389, 445, 3306, 6379].includes(port)) return true;
+  }
+  return false;
+}
+
 const ws = useWebSocket((data: any, raw: any) => {
   // Raw payload helps verify whether WS proxy/route is working and messages are arriving.
   // eslint-disable-next-line no-console
@@ -163,10 +203,9 @@ const ws = useWebSocket((data: any, raw: any) => {
     devices.value.push({ device_id: incomingDeviceId, hostname: "", os: "", updated_at: 0, online: false });
   }
 
-  // If user hasn't manually selected and we're still on the seed device, auto-switch.
+  // If user hasn't manually selected and no device selected yet, auto-switch.
   if (incomingDeviceId !== currentDevice.deviceId) {
-    const seed = seedDevices[0]?.device_id ?? "";
-    const canAutoSwitch = !userSelected.value && currentDevice.deviceId === seed;
+    const canAutoSwitch = !userSelected.value && !currentDevice.deviceId;
     if (canAutoSwitch) {
       switchDevice(incomingDeviceId);
     }
@@ -245,9 +284,82 @@ const ws = useWebSocket((data: any, raw: any) => {
   if ("host_metrics" in data || "hardware_details" in data || "hostMetrics" in data || "hardwareDetails" in data) {
     updateDeviceMetaFromPayload(incomingDeviceId, data);
   }
+  // Keep risk flags fresh if agent pushes security_snapshot via WS.
+  if ("security_snapshot" in data || "securitySnapshot" in data) {
+    const idx = devices.value.findIndex((d) => d.device_id === incomingDeviceId);
+    if (idx >= 0) {
+      const ss = normalizeObject((data as any).security_snapshot ?? (data as any).securitySnapshot);
+      const hasCritical = hasCriticalFromSecuritySnapshotObj(ss);
+      const prev = devices.value[idx];
+      const next = { ...prev };
+      next.has_critical_risk = hasCritical;
+      next.had_critical_risk = !!prev.had_critical_risk || hasCritical;
+      if (hasCritical) next.last_critical_at = Math.floor(Date.now() / 1000);
+      devices.value[idx] = next;
+      lastUpdateTrigger.value++;
+    }
+  }
 });
 
 const connectionStatus = ws.status;
+
+function connectGlobal() {
+  try {
+    // eslint-disable-next-line no-console
+    console.error("DEBUG: Starting Global WS connection process...");
+    const url = `ws://${window.location.hostname}:8080/global_status`;
+    // eslint-disable-next-line no-console
+    console.log("Attempting Global WS connection to:", url);
+    wsGlobal = new WebSocket(url);
+    wsGlobal.onopen = () => {
+      // eslint-disable-next-line no-console
+      console.log("[ws-global] open");
+    };
+    wsGlobal.onmessage = (ev) => {
+      try {
+        const msg = typeof ev.data === "string" ? JSON.parse(ev.data) : ev.data;
+        // eslint-disable-next-line no-console
+        console.log("[GlobalWS] Received:", msg);
+        if (msg?.type === "device_update" && typeof msg?.device_id === "string") {
+          const id = msg.device_id as string;
+          const online = !!msg.online;
+          const idx = devices.value.findIndex((d) => d.device_id === id);
+          if (idx >= 0) {
+            const next = { ...devices.value[idx], online, updated_at: online ? Math.floor(Date.now() / 1000) : devices.value[idx].updated_at };
+            devices.value[idx] = next;
+            devices.value = [...devices.value];
+          } else {
+            const added = { device_id: id, hostname: "", os: "", updated_at: online ? Math.floor(Date.now() / 1000) : 0, online };
+            devices.value = [...devices.value, added];
+          }
+          lastUpdateTrigger.value++;
+        } else if (msg?.type === "device_snapshot" && Array.isArray(msg?.devices)) {
+          // 强制整体替换，触发列表重绘
+          // eslint-disable-next-line no-console
+          console.log("Processing snapshot for", (msg.devices as any[]).length, "devices");
+          devices.value = [...(msg.devices as any[])];
+          // 额外保险：强制触发计算属性
+          lastUpdateTrigger.value++;
+          // 调试：确认当前列表长度
+          // eslint-disable-next-line no-console
+          console.log("Current devices in list:", devices.value.length);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    wsGlobal.onclose = () => {
+      // eslint-disable-next-line no-console
+      console.log("[ws-global] close");
+      wsGlobal = null;
+    };
+    wsGlobal.onerror = () => {
+      try { wsGlobal?.close(); } catch {}
+    };
+  } catch {
+    // ignore
+  }
+}
 
 async function fetchSnapshot(deviceId: string, mySeq: number) {
   try {
@@ -289,6 +401,15 @@ function connectWebSocket(deviceId: string) {
   ws.connect(deviceId);
 }
 
+function retryWS() {
+  if (!currentDevice.deviceId) return;
+  // Manual reconnect: reconnect WS + immediately re-fetch snapshot so UI updates faster.
+  connectWebSocket(currentDevice.deviceId);
+  seq++;
+  const mySeq = seq;
+  void fetchSnapshot(currentDevice.deviceId, mySeq);
+}
+
 function switchDevice(deviceId: string) {
   if (!deviceId) return;
   if (deviceId === currentDevice.deviceId) return;
@@ -324,6 +445,14 @@ function handleUserSelect(deviceId: string) {
   switchDevice(deviceId);
 }
 
+function goMonitor() {
+  void router.push({ path: "/" });
+}
+
+function goAssets() {
+  void router.push({ path: "/assets" });
+}
+
 // If we reconnect after backend restart and WS hasn't pushed yet, re-fetch once.
 watch(
   connectionStatus,
@@ -334,6 +463,17 @@ watch(
       void fetchSnapshot(currentDevice.deviceId, mySeq);
     }
   }
+);
+
+watch(
+  () => route.query.device,
+  (v) => {
+    const deviceId = String(v || "").trim();
+    if (!deviceId) return;
+    if (isAssetsView.value) return;
+    handleUserSelect(deviceId);
+  },
+  { immediate: true }
 );
 
 // Lightweight auto-retry: if WS在线但长时间未收到 host_metrics，定时通过 HTTP 再拉一次快照补齐。
@@ -355,7 +495,15 @@ function ensureMetricsPolling() {
 }
 
 onMounted(() => {
+  // Connect global WS ASAP
+  connectGlobal();
+
   ensureMetricsPolling();
+
+  // Keep the left device list "online" dot in sync with last snapshot time.
+  deviceOnlineTick = window.setInterval(() => {
+    syncDeviceOnlineDots();
+  }, 3000);
 });
 
 onUnmounted(() => {
@@ -363,6 +511,12 @@ onUnmounted(() => {
     window.clearInterval(metricsTick);
     metricsTick = null;
   }
+  if (deviceOnlineTick != null) {
+    window.clearInterval(deviceOnlineTick);
+    deviceOnlineTick = null;
+  }
+  try { wsGlobal?.close(); } catch {}
+  wsGlobal = null;
 });
 
 // Initial load: fetch device ids from backend so LAN users don't start from an empty list.
@@ -372,6 +526,7 @@ onMounted(async () => {
     const list: DeviceInfo[] = resp.data?.devices ?? [];
     if (Array.isArray(list) && list.length > 0) {
       devices.value = list;
+      syncDeviceOnlineDots();
       const firstId = list[0]?.device_id ?? "";
       if (firstId) {
         selectedDeviceId.value = firstId;
@@ -383,24 +538,68 @@ onMounted(async () => {
     // Ignore; fallback to the seed device.
   }
 
-  // Fallback: try seed device id if exists.
-  if (selectedDeviceId.value) switchDevice(selectedDeviceId.value);
+  // No devices yet: keep empty selection; wait for WS/global snapshot.
 });
 </script>
 
 <template>
-  <div class="h-screen flex bg-slate-950 text-slate-100 overflow-hidden">
-    <aside class="w-full lg:w-80">
-      <DeviceList
-        :devices="devices"
-        :selected-device-id="selectedDeviceId"
-        @select="handleUserSelect"
-      />
-    </aside>
+  <div class="h-screen w-full flex flex-col text-slate-200 overflow-hidden bg-slate-950">
+    <header class="h-12 shrink-0 border-b border-slate-800 px-4 flex items-center justify-between bg-slate-950/95">
+      <div class="text-sm tracking-wide text-slate-300">Go-Agent 控制台</div>
+      <div class="flex items-center gap-2">
+        <button class="px-3 py-1.5 text-xs rounded border"
+          :class="!isAssetsView ? 'border-cyan-600 bg-cyan-500/10 text-cyan-300' : 'border-slate-700 text-slate-300 hover:bg-slate-800/50'"
+          @click="goMonitor">实时监控</button>
+        <button class="px-3 py-1.5 text-xs rounded border"
+          :class="isAssetsView ? 'border-cyan-600 bg-cyan-500/10 text-cyan-300' : 'border-slate-700 text-slate-300 hover:bg-slate-800/50'"
+          @click="goAssets">资产中心</button>
+      </div>
+    </header>
 
-    <main class="flex-1 h-screen overflow-hidden">
-      <DeviceDetail :device="currentDevice" :ws-status="connectionStatus" />
-    </main>
+    <AssetsHub v-if="isAssetsView" :devices="devices" />
+
+    <div v-else class="flex-1 w-full flex overflow-hidden">
+      <aside class="sidebar">
+        <DeviceList
+          :devices="devices"
+          :selected-device-id="selectedDeviceId"
+          :update-trigger="lastUpdateTrigger"
+          @select="handleUserSelect"
+        />
+      </aside>
+
+      <main class="flex-1 h-full overflow-hidden bg-slate-950/60 relative">
+        <div
+          v-if="connectionStatus !== 'online'"
+          class="toast-banner"
+          :class="{
+            'banner-warning': connectionStatus === 'reconnecting',
+            'banner-danger': connectionStatus === 'offline'
+          }"
+        >
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full"
+                  :class="{
+                    'bg-state-warning': connectionStatus === 'reconnecting',
+                    'bg-state-danger' : connectionStatus === 'offline'
+                  }"></span>
+            <span class="font-medium">
+              {{ connectionStatus === 'reconnecting' ? '正在重连 WebSocket' : 'WebSocket 已断开' }}
+            </span>
+            <button
+              class="ml-3 text-[11px] px-2 py-0.5 rounded border border-slate-700 bg-slate-900/40 hover:bg-slate-900/70"
+              @click="retryWS"
+            >立即重试</button>
+          </div>
+        </div>
+
+        <DeviceDetail
+          :device="currentDevice"
+          :ws-status="connectionStatus"
+          @retry-ws="retryWS"
+        />
+      </main>
+    </div>
   </div>
 </template>
 

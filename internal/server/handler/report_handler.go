@@ -1,14 +1,22 @@
 package handler
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/qinyilin/go-agent/internal/collector"
 	"github.com/qinyilin/go-agent/internal/server/model"
 	"github.com/qinyilin/go-agent/internal/server/store"
 	"github.com/qinyilin/go-agent/internal/server/ws"
@@ -18,6 +26,22 @@ type ReportHandler struct {
 	store  *store.RedisSnapshotStore
 	wsHub  *ws.Hub
 	logger *slog.Logger
+}
+
+// ApiBatchRequest is a Swagger-facing schema for /report batch ingest.
+// Real runtime parsing still uses ingestBatchRequest for compatibility.
+type ApiBatchRequest struct {
+	Items []ApiBatchItem `json:"items"`
+}
+
+// ApiBatchItem documents possible payload models by dataType.
+type ApiBatchItem struct {
+	DataType string         `json:"dataType"`
+	Payload  map[string]any `json:"payload,omitempty"`
+
+	// Optional typed hints for Swagger model expansion:
+	HostMetrics      *collector.HostMetrics    `json:"host_metrics,omitempty"`
+	SecuritySnapshot *collector.SecuritySnapshot `json:"security_snapshot,omitempty"`
 }
 
 func NewReportHandler(snapshotStore *store.RedisSnapshotStore, wsHub *ws.Hub, logger *slog.Logger) *ReportHandler {
@@ -40,9 +64,22 @@ func NewReportHandler(snapshotStore *store.RedisSnapshotStore, wsHub *ws.Hub, lo
 //     }
 //  2. DataDispatcher batch (compat):
 //     { "items": [ { "dataType": "process|software", "payload": {...} }, ... ] }
+//
+// ReportMetrics 接收 Agent 上报的批量指标数据
+// @Summary      上报设备指标
+// @Description  接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务和网络连接
+// @Accept       json
+// @Produce      json
+// @Param        Content-Encoding  header  string  true  "必须为 gzip"
+// @Param        payload           body    ApiBatchRequest  true  "指标数据包（批量 items 列表，含 host_metrics/security_snapshot）"
+// @Success      200  {object}  map[string]string "{"status":"ok"}"
+// @Failure      400  {object}  map[string]string "{"error":"invalid JSON"}"
+// @Failure      413  {object}  map[string]string "{"error":"payload too large"}"
+// @Router       /report [post]
 func (h *ReportHandler) HandleReport(c *gin.Context) {
-	body, err := c.GetRawData()
+	body, err := readReportBody(c, maxReportBodyBytes())
 	if err != nil {
+		h.logger.Warn("report read body failed", "err", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
 		return
 	}
@@ -56,11 +93,14 @@ func (h *ReportHandler) HandleReport(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
+	} else if err != nil && isJSONSyntaxErr(err) {
+		h.logInvalidJSON(c, err, body, "batch")
 	}
 
 	// Fallback to old direct-report format.
 	var req model.ReportRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		h.logInvalidJSON(c, err, body, "direct")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
 		return
 	}
@@ -75,6 +115,108 @@ func (h *ReportHandler) HandleReport(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "device_id": req.DeviceID})
+}
+
+func maxReportBodyBytes() int64 {
+	// Default is intentionally generous to tolerate large host_metrics/process snapshots.
+	const def int64 = 32 << 20 // 32 MiB
+	v := strings.TrimSpace(os.Getenv("REPORT_MAX_BODY_BYTES"))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func readReportBody(c *gin.Context, maxBodyBytes int64) ([]byte, error) {
+	req := c.Request
+	if req == nil || req.Body == nil {
+		return nil, errors.New("empty request body")
+	}
+	limited := http.MaxBytesReader(c.Writer, req.Body, maxBodyBytes)
+	encoding := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Encoding")))
+	var reader io.Reader = limited
+	if strings.Contains(encoding, "gzip") {
+		gzr, err := gzip.NewReader(limited)
+		if err != nil {
+			return nil, fmt.Errorf("invalid gzip body: %w", err)
+		}
+		defer gzr.Close()
+		reader = gzr
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func isJSONSyntaxErr(err error) bool {
+	var se *json.SyntaxError
+	var ute *json.UnmarshalTypeError
+	return errors.As(err, &se) || errors.As(err, &ute)
+}
+
+func (h *ReportHandler) logInvalidJSON(c *gin.Context, err error, body []byte, phase string) {
+	offset := int64(-1)
+	var se *json.SyntaxError
+	var ute *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &se):
+		offset = se.Offset
+	case errors.As(err, &ute):
+		offset = ute.Offset
+	}
+	before, after := snippetAroundOffset(body, offset, 200)
+	contentEncoding := ""
+	contentLengthHeader := ""
+	contentLength := int64(-1)
+	if c != nil && c.Request != nil {
+		contentEncoding = c.GetHeader("Content-Encoding")
+		contentLengthHeader = c.GetHeader("Content-Length")
+		contentLength = c.Request.ContentLength
+	}
+
+	h.logger.Warn(
+		"invalid JSON in report payload",
+		"phase", phase,
+		"err", err.Error(),
+		"offset", offset,
+		"payload_len", len(body),
+		"content_encoding", contentEncoding,
+		"content_length_header", contentLengthHeader,
+		"content_length", contentLength,
+		"before_200b", before,
+		"after_200b", after,
+	)
+}
+
+func snippetAroundOffset(body []byte, offset int64, radius int) (string, string) {
+	if len(body) == 0 {
+		return "", ""
+	}
+	// json.SyntaxError offset is 1-based.
+	pos := int(offset) - 1
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(body) {
+		pos = len(body)
+	}
+	start := pos - radius
+	if start < 0 {
+		start = 0
+	}
+	end := pos + radius
+	if end > len(body) {
+		end = len(body)
+	}
+	before := bytes.TrimSpace(body[start:pos])
+	after := bytes.TrimSpace(body[pos:end])
+	return string(before), string(after)
 }
 
 type ingestBatchRequest struct {
@@ -117,17 +259,18 @@ func (h *ReportHandler) handleOldDirect(ctx context.Context, req model.ReportReq
 		req.SoftwareList = []byte("[]")
 	}
 
-	const maxListLen = 1000
-	if out, truncated, origLen, err := truncateJSONArray(req.Processes, maxListLen); err != nil {
+	const maxProcessListLen = 100
+	const maxSoftwareListLen = 1000
+	if out, truncated, origLen, err := truncateJSONArray(req.Processes, maxProcessListLen); err != nil {
 		return err
 	} else if truncated {
-		h.logger.Warn("snapshot truncated", "device_id", req.DeviceID, "field", "processes", "orig_len", origLen, "limit", maxListLen)
+		h.logger.Warn("snapshot truncated", "device_id", req.DeviceID, "field", "processes", "orig_len", origLen, "limit", maxProcessListLen)
 		req.Processes = out
 	}
-	if out, truncated, origLen, err := truncateJSONArray(req.SoftwareList, maxListLen); err != nil {
+	if out, truncated, origLen, err := truncateJSONArray(req.SoftwareList, maxSoftwareListLen); err != nil {
 		return err
 	} else if truncated {
-		h.logger.Warn("snapshot truncated", "device_id", req.DeviceID, "field", "software_list", "orig_len", origLen, "limit", maxListLen)
+		h.logger.Warn("snapshot truncated", "device_id", req.DeviceID, "field", "software_list", "orig_len", origLen, "limit", maxSoftwareListLen)
 		req.SoftwareList = out
 	}
 
@@ -170,7 +313,8 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 		}
 	}
 
-	const maxListLen = 1000
+	const maxProcessListLen = 100
+	const maxSoftwareListLen = 1000
 	now := time.Now().Unix()
 
 	partials := make(map[string]*devicePartialUpdate)
@@ -202,6 +346,28 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 			p := getPartial(fp)
 			p.hasHostMetrics = true
 			p.hostMetricsRaw = it.Payload
+			// Optional debug: verify host_metrics contains per-NIC drop counters.
+			if os.Getenv("DEBUG_REPORT_HOSTMETRICS_NETWORK") == "1" {
+				var dbg struct {
+					NetworkInterfaces []struct {
+						DropIn  uint64 `json:"drop_in"`
+						DropOut uint64 `json:"drop_out"`
+					} `json:"network_interfaces"`
+				}
+				if err := json.Unmarshal(it.Payload, &dbg); err == nil && len(dbg.NetworkInterfaces) > 0 {
+					first := dbg.NetworkInterfaces[0]
+					h.logger.Info("debug report host_metrics network drops",
+						"device_id", fp,
+						"interfaces", len(dbg.NetworkInterfaces),
+						"first_drop_in", first.DropIn,
+						"first_drop_out", first.DropOut,
+					)
+				} else if err != nil {
+					h.logger.Info("debug report host_metrics network drops parse failed", "device_id", fp, "err", err.Error())
+				} else {
+					h.logger.Info("debug report host_metrics network drops missing interfaces", "device_id", fp)
+				}
+			}
 
 		case "hardware_details":
 			fp := extractFingerprintFromPayload(it.Payload)
@@ -230,12 +396,12 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 				continue
 			}
 
-			out, truncated, origLen, err := truncateJSONArray(processesRaw, maxListLen)
+			out, truncated, origLen, err := truncateJSONArray(processesRaw, maxProcessListLen)
 			if err != nil {
 				return err
 			}
 			if truncated {
-				h.logger.Warn("snapshot truncated", "device_id", fp, "field", "processes", "orig_len", origLen, "limit", maxListLen)
+				h.logger.Warn("snapshot truncated", "device_id", fp, "field", "processes", "orig_len", origLen, "limit", maxProcessListLen)
 			}
 			p := getPartial(fp)
 			p.hasProcesses = true
@@ -259,12 +425,12 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 				continue
 			}
 
-			out, truncated, origLen, err := truncateJSONArray(softwareRaw, maxListLen)
+			out, truncated, origLen, err := truncateJSONArray(softwareRaw, maxSoftwareListLen)
 			if err != nil {
 				return err
 			}
 			if truncated {
-				h.logger.Warn("snapshot truncated", "device_id", fp, "field", "software_list", "orig_len", origLen, "limit", maxListLen)
+				h.logger.Warn("snapshot truncated", "device_id", fp, "field", "software_list", "orig_len", origLen, "limit", maxSoftwareListLen)
 			}
 			p := getPartial(fp)
 			p.hasSoftware = true
@@ -376,6 +542,9 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 		}
 		if p.hasSecuritySnapshot {
 			merged.SecuritySnapshot = p.securitySnapshotRaw
+			if hasCritical3389Public(p.securitySnapshotRaw) {
+				go h.sendCriticalAlert(deviceID, p.securitySnapshotRaw)
+			}
 		}
 
 		if err := h.store.SaveSnapshot(saveCtx, merged); err != nil {
@@ -393,6 +562,65 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 	}
 
 	return nil
+}
+
+func hasCritical3389Public(raw []byte) bool {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return false
+	}
+	listening, _ := obj["listening"].([]any)
+	if len(listening) == 0 {
+		listening, _ = obj["Listening"].([]any)
+	}
+	for _, it := range listening {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		scopeRaw := m["scope"]
+		if scopeRaw == nil {
+			scopeRaw = m["Scope"]
+		}
+		scope := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", scopeRaw)))
+		if scope != "public" {
+			continue
+		}
+		portRaw := m["port"]
+		if portRaw == nil {
+			portRaw = m["Port"]
+		}
+		p, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprintf("%v", portRaw)), 10, 64)
+		if p == 3389 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ReportHandler) sendCriticalAlert(deviceID string, raw []byte) {
+	webhook := strings.TrimSpace(os.Getenv("ALERT_WEBHOOK_URL"))
+	if webhook == "" {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"text":      "[AutoAlert] 检测到公网暴露 CRITICAL 端口 3389",
+		"device_id": deviceID,
+		"ts":        time.Now().Unix(),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook, bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.logger.Warn("auto alert send failed", "device_id", deviceID, "err", err)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 func (h *ReportHandler) broadcastSnapshot(deviceID string, snap model.SnapshotPush) {

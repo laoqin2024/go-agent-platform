@@ -1,0 +1,23 @@
+# 2000台规模监控项目开发准则
+
+## 1. 核心架构约束 (Critical)
+- **指纹校验**：所有从 Agent 发出的 batch 内部子项 (processes, services, net_conns) 必须显式包含 `fingerprint` 字段。严禁发送无主数据。
+- **内存安全**：处理上报数据时，必须检查 `Content-Length`，严禁在未限制大小的情况下调用 `ioutil.ReadAll`。
+- **Gzip 强制**：所有上报接口必须验证 `Content-Encoding: gzip` 头部。
+
+## 2. 后端开发 (Golang)
+- **字段对齐**：所有 `types.go` 中的 JSON 标签必须使用 `snake_case` (如 `cpu_percent`)。
+- **错误处理**：严禁忽略 `err`。采集硬件信息失败时必须有 Fallback 逻辑，不能返回空对象导致解析错误。
+- **并发控制**：在处理 2000 台设备状态变更时，必须使用原子操作或带超时的 Mutex。
+
+## 3. 前端开发 (Vue 3 + Vite)
+- **响应式安全**：访问 `device.host_metrics` 时必须使用可选链 `?.`。
+- **缓存重置**：在 `watch(deviceId)` 切换设备时，必须立即物理清空 `txRate`, `rxRate`, `ifaceRateHistory` 等所有速率缓存，严禁残留上一个设备的数据。
+- **速率计算**：
+    - 必须包含回绕检查 (current < last => rate = 0)。
+    - 必须包含尖峰过滤 (> 10GB/s 视为脏数据)。
+    - 必须包含首帧保护 (isFirstFrame = true 时不计算速率)。
+
+## 4. 文档规范
+- 修改 API 逻辑后，必须同步更新函数上方的 Swagger 注释。
+- 新增组件必须配套说明其对数据为空（Loading）态的处理逻辑。

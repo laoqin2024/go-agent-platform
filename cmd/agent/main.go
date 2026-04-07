@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/qinyilin/go-agent/internal/buffer"
+	"github.com/qinyilin/go-agent/internal/collector"
 	internalservice "github.com/qinyilin/go-agent/internal/service"
 	"github.com/qinyilin/go-agent/internal/transport"
 
@@ -41,6 +44,10 @@ func main() {
 		serviceName        = flag.String("name", "go-agent", "kardianos/service service name")
 		displayName        = flag.String("display-name", "Go Agent", "service display name")
 		description        = flag.String("description", "Cross-platform IT device data collection agent", "service description")
+		deviceID           = flag.String("device-id", "", "control channel device id, default hardware fingerprint")
+		controlToken       = flag.String("control-token", "", "control channel shared token")
+		allowedScripts     = flag.String("control-allowed-scripts", "clean_cache,restart_monitor", "allowed custom scripts")
+		allowedServices    = flag.String("control-allowed-services", "go-agent", "allowed restart service names")
 	)
 	flag.Parse()
 
@@ -104,11 +111,27 @@ func main() {
 			internalservice.WithDispatcherRequestTTL(10*time.Second),
 		)
 	}
+	controlDeviceID := *deviceID
+	if controlDeviceID == "" {
+		hw, err := collector.NewHardwareCollector().CollectWithContext(context.Background())
+		if err == nil && hw.Fingerprint != "" {
+			controlDeviceID = hw.Fingerprint
+		}
+	}
+	controlRunner := internalservice.NewControlRunner(
+		logger,
+		controlDeviceID,
+		*apiURL,
+		*controlToken,
+		splitCSV(*allowedScripts),
+		splitCSV(*allowedServices),
+	)
 	wrapper := internalservice.NewAgentService(
 		engine,
 		logger,
 		internalservice.WithStopTimeout(*stopTimeout),
 		internalservice.WithDispatcher(dispatcher),
+		internalservice.WithControlRunner(controlRunner),
 	)
 
 	if runForeground {
@@ -151,3 +174,18 @@ func main() {
 }
 
 var _ = slog.LevelInfo
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}

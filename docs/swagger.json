@@ -1,0 +1,687 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "高并发 Agent 采集与实时监控数据上报系统",
+        "title": "2000台规模设备监控平台 API",
+        "contact": {
+            "name": "开发团队"
+        },
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/api/v1",
+    "paths": {
+        "/device/{device_id}/snapshot": {
+            "get": {
+                "summary": "获取设备详情",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "设备唯一指纹",
+                        "name": "device_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.DeviceSnapshotResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "{\"error\":\"device_id is required\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "{\"error\":\"snapshot not found\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "{\"error\":\"redis load failed\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/ingest": {
+            "post": {
+                "description": "接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务、网络连接与安全快照（当在公开地址上暴露高危端口 22/3389/445/3306 时，listening 项将返回 is_high_risk=true）",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "summary": "上报设备指标",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "必须为 gzip",
+                        "name": "Content-Encoding",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "指标数据包（包含 security_snapshot.listening 的 is_high_risk 标志）",
+                        "name": "payload",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/main.ApiBatchRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "{\"status\":\"ok\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "{\"error\":\"invalid JSON\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "{\"error\":\"payload too large\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/report": {
+            "post": {
+                "description": "接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务和网络连接",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "summary": "上报设备指标",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "必须为 gzip",
+                        "name": "Content-Encoding",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "指标数据包（批量 items 列表，含 host_metrics/security_snapshot）",
+                        "name": "payload",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.ApiBatchRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "{\"status\":\"ok\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "{\"error\":\"invalid JSON\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "{\"error\":\"payload too large\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "collector.CPUStats": {
+            "type": "object",
+            "properties": {
+                "total": {
+                    "description": "Total is the overall CPU utilization percent (0-100).",
+                    "type": "number",
+                    "format": "float64"
+                }
+            }
+        },
+        "collector.DiskIOStats": {
+            "type": "object",
+            "properties": {
+                "device_name": {
+                    "type": "string"
+                },
+                "read_iops": {
+                    "type": "number"
+                },
+                "read_kbps": {
+                    "type": "number"
+                },
+                "util_percent": {
+                    "type": "number"
+                },
+                "write_iops": {
+                    "type": "number"
+                },
+                "write_kbps": {
+                    "type": "number"
+                }
+            }
+        },
+        "collector.DiskStats": {
+            "type": "object",
+            "properties": {
+                "free": {
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "total": {
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "used": {
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "usedPercent": {
+                    "type": "number",
+                    "format": "float64"
+                }
+            }
+        },
+        "collector.GpuStat": {
+            "type": "object",
+            "properties": {
+                "memory_total_mb": {
+                    "type": "number"
+                },
+                "memory_used_mb": {
+                    "type": "number"
+                },
+                "model": {
+                    "type": "string"
+                },
+                "temperature": {
+                    "type": "number"
+                },
+                "util_percent": {
+                    "type": "number"
+                }
+            }
+        },
+        "collector.HostMetrics": {
+            "type": "object",
+            "properties": {
+                "collectedAt": {
+                    "type": "string"
+                },
+                "cpu": {
+                    "$ref": "#/definitions/collector.CPUStats"
+                },
+                "disk": {
+                    "$ref": "#/definitions/collector.DiskStats"
+                },
+                "disk_io": {
+                    "description": "DiskIO contains per-device I/O performance metrics derived from gopsutil\ndisk.IOCounters deltas between collection intervals.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.DiskIOStats"
+                    }
+                },
+                "fingerprint": {
+                    "type": "string"
+                },
+                "gpu_stats": {
+                    "description": "GpuStats provides per-GPU realtime telemetry (best-effort).",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.GpuStat"
+                    }
+                },
+                "hostname": {
+                    "type": "string"
+                },
+                "memory": {
+                    "$ref": "#/definitions/collector.MemoryStats"
+                },
+                "network": {
+                    "$ref": "#/definitions/collector.NetworkStats"
+                },
+                "network_interfaces": {
+                    "description": "network_interfaces provides per-active-NIC counters for deeper monitoring.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.NetworkInterfaceStats"
+                    }
+                },
+                "ping_latency_ms": {
+                    "description": "PingLatencyMs is the best-effort baseline RTT (ms) against configured targets.",
+                    "type": "integer"
+                },
+                "processes": {
+                    "description": "Processes contains a best-effort Top-N process insight snapshot (for UI).",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.ProcessStat"
+                    }
+                },
+                "security_snapshot": {
+                    "description": "SecuritySnapshot contains best-effort host security telemetry (e.g., listening ports).",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/collector.SecuritySnapshot"
+                        }
+                    ]
+                },
+                "services": {
+                    "description": "Services contains a best-effort service health snapshot (failed + whitelist only).",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.ServiceStat"
+                    }
+                }
+            }
+        },
+        "collector.HotfixInfo": {
+            "type": "object",
+            "properties": {
+                "installed_at": {
+                    "type": "string"
+                },
+                "kb": {
+                    "type": "string"
+                }
+            }
+        },
+        "collector.ListeningPort": {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "description": "e.g. 0.0.0.0 / 127.0.0.1 / ::",
+                    "type": "string"
+                },
+                "is_high_risk": {
+                    "description": "IsHighRisk is true when a high-risk port (22, 3389, 445, 3306) is exposed on a public address (0.0.0.0/::).",
+                    "type": "boolean"
+                },
+                "port": {
+                    "type": "integer"
+                },
+                "protocol": {
+                    "description": "tcp / udp",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope: public (0.0.0.0/::), local (127.0.0.1/::1), private/other best-effort classification",
+                    "type": "string"
+                }
+            }
+        },
+        "collector.MemoryStats": {
+            "type": "object",
+            "properties": {
+                "total": {
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "used": {
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "usedPercent": {
+                    "type": "number",
+                    "format": "float64"
+                }
+            }
+        },
+        "collector.NetConnInfo": {
+            "type": "object",
+            "properties": {
+                "local_addr": {
+                    "type": "string"
+                },
+                "local_port": {
+                    "type": "integer"
+                },
+                "pid": {
+                    "type": "integer"
+                },
+                "process_name": {
+                    "type": "string"
+                },
+                "protocol": {
+                    "type": "string"
+                },
+                "remote_addr": {
+                    "type": "string"
+                },
+                "remote_port": {
+                    "type": "integer"
+                },
+                "state": {
+                    "description": "LISTEN / ESTABLISHED",
+                    "type": "string"
+                }
+            }
+        },
+        "collector.NetworkInterfaceStats": {
+            "type": "object",
+            "properties": {
+                "bytes_recv": {
+                    "type": "integer"
+                },
+                "bytes_sent": {
+                    "type": "integer"
+                },
+                "drop_in": {
+                    "type": "integer"
+                },
+                "drop_out": {
+                    "type": "integer"
+                },
+                "errors_in": {
+                    "type": "integer"
+                },
+                "errors_out": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "packets_recv": {
+                    "type": "integer"
+                },
+                "packets_sent": {
+                    "type": "integer"
+                }
+            }
+        },
+        "collector.NetworkStats": {
+            "type": "object",
+            "properties": {
+                "bytesRecv": {
+                    "description": "Cumulative bytes since system boot (or last reset depending on OS semantics).",
+                    "type": "integer",
+                    "format": "int64"
+                },
+                "bytesSent": {
+                    "type": "integer",
+                    "format": "int64"
+                }
+            }
+        },
+        "collector.ProcessStat": {
+            "type": "object",
+            "properties": {
+                "cgroup": {
+                    "description": "CGroup is a best-effort cgroup path (Linux) used to keep service mapping stable across PID changes.",
+                    "type": "string"
+                },
+                "collected_at": {
+                    "type": "string"
+                },
+                "cpu_percent": {
+                    "description": "CPUPercent is the best-effort CPU usage percentage.",
+                    "type": "number"
+                },
+                "exec_path": {
+                    "type": "string"
+                },
+                "listening_ports": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "memory_bytes": {
+                    "description": "MemoryBytes keeps backwards compatibility with existing UI fields.",
+                    "type": "integer"
+                },
+                "memory_mb": {
+                    "description": "MemoryMB is the best-effort resident memory usage (MB).",
+                    "type": "number"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "pid": {
+                    "type": "integer"
+                },
+                "service_name": {
+                    "description": "ServiceName is a best-effort owning service label (systemd/launchd/Windows service).",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is a best-effort running state string (e.g., running/sleeping).",
+                    "type": "string"
+                },
+                "uptime_sec": {
+                    "description": "UptimeSec is seconds since process creation time.",
+                    "type": "integer"
+                },
+                "username": {
+                    "type": "string"
+                }
+            }
+        },
+        "collector.SecuritySnapshot": {
+            "type": "object",
+            "properties": {
+                "collected_at": {
+                    "type": "string"
+                },
+                "connections": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.NetConnInfo"
+                    }
+                },
+                "hotfixes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.HotfixInfo"
+                    }
+                },
+                "listening": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.ListeningPort"
+                    }
+                },
+                "startup": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.StartupItem"
+                    }
+                }
+            }
+        },
+        "collector.ServiceStat": {
+            "type": "object",
+            "properties": {
+                "container_count": {
+                    "description": "ContainerCount is best-effort (Docker service): number of containers (usually running) on this host.",
+                    "type": "integer"
+                },
+                "exit_code": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "restart_count": {
+                    "type": "integer"
+                },
+                "start_type": {
+                    "description": "StartType is best-effort (Windows): auto/manual/disabled",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is best-effort: Active/Inactive/Failed/Running/Stopped...",
+                    "type": "string"
+                },
+                "uptime_sec": {
+                    "type": "integer"
+                }
+            }
+        },
+        "collector.StartupItem": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string"
+                },
+                "location": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.ApiBatchItem": {
+            "type": "object",
+            "properties": {
+                "dataType": {
+                    "type": "string"
+                },
+                "host_metrics": {
+                    "description": "Optional typed hints for Swagger model expansion:",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/collector.HostMetrics"
+                        }
+                    ]
+                },
+                "payload": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "security_snapshot": {
+                    "$ref": "#/definitions/collector.SecuritySnapshot"
+                }
+            }
+        },
+        "handler.ApiBatchRequest": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handler.ApiBatchItem"
+                    }
+                }
+            }
+        },
+        "handler.DeviceSnapshotResponse": {
+            "type": "object",
+            "properties": {
+                "device_id": {
+                    "type": "string"
+                },
+                "hardware_details": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "host_metrics": {
+                    "$ref": "#/definitions/collector.HostMetrics"
+                },
+                "network_connections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": {}
+                    }
+                },
+                "process_snapshot": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "processes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.ProcessStat"
+                    }
+                },
+                "security_snapshot": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "service_snapshot": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/collector.ServiceStat"
+                    }
+                },
+                "software_inventory": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": {}
+                    }
+                },
+                "software_list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": {}
+                    }
+                },
+                "updated_at": {
+                    "type": "integer"
+                }
+            }
+        },
+        "main.ApiBatchRequest": {
+            "type": "object"
+        }
+    }
+}

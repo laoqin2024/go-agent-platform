@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,7 @@ type SecuritySnapshot struct {
 	Connections []NetConnInfo  `json:"connections"`
 	Startup     []StartupItem  `json:"startup"`
 	Hotfixes    []HotfixInfo   `json:"hotfixes"`
+	Listening   []ListeningPort `json:"listening,omitempty"`
 	CollectedAt time.Time      `json:"collected_at"`
 }
 
@@ -50,6 +52,7 @@ func (s *SecurityCollector) CollectWithContext(ctx context.Context) (SecuritySna
 	defer cancel()
 
 	conns, _ := collectNetworkConnections(ctx)
+	conns = filterExternalEstablishedConns(conns)
 	startup, _ := collectStartupItems(ctx)
 	hotfixes, _ := collectHotfixes(ctx)
 
@@ -61,3 +64,17 @@ func (s *SecurityCollector) CollectWithContext(ctx context.Context) (SecuritySna
 	}, nil
 }
 
+func filterExternalEstablishedConns(in []NetConnInfo) []NetConnInfo {
+	out := make([]NetConnInfo, 0, len(in))
+	for _, c := range in {
+		if !strings.EqualFold(strings.TrimSpace(c.State), "ESTABLISHED") {
+			continue
+		}
+		ra := strings.TrimSpace(strings.ToLower(c.RemoteAddr))
+		if ra == "" || ra == "127.0.0.1" || ra == "::1" || ra == "localhost" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}

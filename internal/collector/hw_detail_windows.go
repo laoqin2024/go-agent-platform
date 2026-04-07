@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"unsafe"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"

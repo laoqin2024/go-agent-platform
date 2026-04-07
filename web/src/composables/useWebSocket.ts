@@ -16,6 +16,14 @@ export function useWebSocket(onMessage: (data: any, raw: any) => void) {
   let timer: number | null = null;
   const maxDelayMs = 30000;
 
+  // Anti-flicker / isolation
+  let lastComputeTime = 0;
+  let lastValidNetBytes: { sent: number; recv: number; ts: number } | null = null;
+  let isFirstFrame = true;
+  // Cache last good interface counters so we can "freeze" only network-related fields.
+  // This avoids dropping the entire frame (which would also skip host_metrics.security_snapshot updates).
+  let lastNetIfacesRaw: any[] | null = null;
+
   const clearTimer = () => {
     if (timer != null) {
       window.clearTimeout(timer);
@@ -54,6 +62,12 @@ export function useWebSocket(onMessage: (data: any, raw: any) => void) {
     deviceId = id;
     manualClose = false;
     clearTimer();
+    // Make UI feedback immediate; we'll switch to "online" on socket.onopen.
+    status.value = "reconnecting";
+    // Reset per-device WS caches to avoid leaking previous device state
+    lastComputeTime = 0;
+    lastValidNetBytes = null;
+    isFirstFrame = true;
 
     let url: string;
     // In dev we MUST go through Vite so proxy `/ws` can forward to Go backend.
@@ -96,7 +110,109 @@ export function useWebSocket(onMessage: (data: any, raw: any) => void) {
       // eslint-disable-next-line no-console
       console.log("[ws] message", { deviceId, url: lastUrl, raw: ev.data });
       try {
+        const now = Date.now();
+        // Throttle: dt < 100ms => drop frame to avoid jitter
+        if (now - lastComputeTime < 100) {
+          return;
+        }
+        lastComputeTime = now;
+
         const parsed = typeof ev.data === "string" ? JSON.parse(ev.data) : ev.data;
+
+        // 1) Single-device filter: message must belong to the active device (when available)
+        const msgDeviceId =
+          parsed?.device_id ??
+          parsed?.deviceId ??
+          parsed?.host_metrics?.device_id ??
+          parsed?.hostMetrics?.device_id ??
+          parsed?.host_metrics?.deviceId ??
+          parsed?.hostMetrics?.deviceId ??
+          null;
+        if (deviceId && msgDeviceId && msgDeviceId !== deviceId) {
+          return;
+        }
+
+        // 2) Gather network counters for guards and first-frame init
+        const netIfaces =
+          parsed?.host_metrics?.network_interfaces ??
+          parsed?.hostMetrics?.network_interfaces ??
+          parsed?.network_interfaces ??
+          [];
+        if (Array.isArray(netIfaces) && netIfaces.length > 0) {
+          let sumSent = 0;
+          let sumRecv = 0;
+          for (const it of netIfaces) {
+            const bs =
+              Number(it?.bytes_sent ?? it?.BytesSent ?? it?.bytesSent ?? 0);
+            const br =
+              Number(it?.bytes_recv ?? it?.BytesRecv ?? it?.bytesRecv ?? 0);
+            sumSent += Number.isFinite(bs) ? bs : 0;
+            sumRecv += Number.isFinite(br) ? br : 0;
+          }
+          // First-frame guard: establish baseline only, do not forward to UI
+          if (isFirstFrame) {
+            lastValidNetBytes = { sent: sumSent, recv: sumRecv, ts: now };
+            lastNetIfacesRaw = netIfaces;
+            isFirstFrame = false;
+            return;
+          }
+          // State freezing: reject frames with regressed or all-zero counters within 3s window
+          if (lastValidNetBytes) {
+            const regressed =
+              sumSent < lastValidNetBytes.sent || sumRecv < lastValidNetBytes.recv;
+            const isAllZero = sumSent === 0 && sumRecv === 0;
+            const within3s = now - lastValidNetBytes.ts < 3000;
+            if ((regressed || isAllZero) && within3s) {
+              // Freeze network counters but still forward the frame so other host_metrics
+              // fields (e.g. security_snapshot / listening ports) can update.
+              const patched: any = parsed;
+              const targetNetIfaces = lastNetIfacesRaw;
+              if (targetNetIfaces && Array.isArray(targetNetIfaces)) {
+                if (patched?.host_metrics?.network_interfaces !== undefined) {
+                  patched.host_metrics.network_interfaces = targetNetIfaces;
+                } else if (patched?.hostMetrics?.network_interfaces !== undefined) {
+                  patched.hostMetrics.network_interfaces = targetNetIfaces;
+                } else if (patched?.network_interfaces !== undefined) {
+                  patched.network_interfaces = targetNetIfaces;
+                } else {
+                  // Best-effort: set both host_metrics and hostMetrics to keep downstream lookups working.
+                  if (patched?.host_metrics) patched.host_metrics.network_interfaces = targetNetIfaces;
+                  if (patched?.hostMetrics) patched.hostMetrics.network_interfaces = targetNetIfaces;
+                }
+              }
+
+              // Also freeze total Network bytes if present (used by netSent/netRecv).
+              if (lastValidNetBytes) {
+                if (patched?.host_metrics?.Network) {
+                  patched.host_metrics.Network.BytesSent = lastValidNetBytes.sent;
+                  patched.host_metrics.Network.BytesRecv = lastValidNetBytes.recv;
+                }
+                if (patched?.host_metrics?.network_bytes_sent !== undefined) {
+                  patched.host_metrics.network_bytes_sent = lastValidNetBytes.sent;
+                }
+                if (patched?.host_metrics?.network_bytes_recv !== undefined) {
+                  patched.host_metrics.network_bytes_recv = lastValidNetBytes.recv;
+                }
+                if (patched?.hostMetrics?.Network) {
+                  patched.hostMetrics.Network.BytesSent = lastValidNetBytes.sent;
+                  patched.hostMetrics.Network.BytesRecv = lastValidNetBytes.recv;
+                }
+                if (patched?.hostMetrics?.network_bytes_sent !== undefined) {
+                  patched.hostMetrics.network_bytes_sent = lastValidNetBytes.sent;
+                }
+                if (patched?.hostMetrics?.network_bytes_recv !== undefined) {
+                  patched.hostMetrics.network_bytes_recv = lastValidNetBytes.recv;
+                }
+              }
+
+              onMessage(patched, ev.data);
+              return;
+            }
+          }
+          lastValidNetBytes = { sent: sumSent, recv: sumRecv, ts: now };
+          lastNetIfacesRaw = netIfaces;
+        }
+
         onMessage(parsed, ev.data);
       } catch {
         // ignore invalid message

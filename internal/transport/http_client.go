@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -112,11 +113,18 @@ func NewHttpClient(
 
 // PostJSON sends a JSON request body via POST and returns the status and response body.
 func (h *HttpClient) PostJSON(ctx context.Context, reqBody []byte) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, bytes.NewReader(reqBody))
+	// Always gzip-compress requests to reduce ingest bandwidth and avoid large body spikes.
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write(reqBody)
+	_ = gw.Close()
+	bodyReader := io.Reader(&buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, bodyReader)
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
 
 	resp, err := h.client.Do(req)
 	if err != nil {

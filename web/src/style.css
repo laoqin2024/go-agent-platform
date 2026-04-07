@@ -10,3 +10,30 @@ html, body, #app {
 body {
   margin: 0;
 }
+
+/* Design System components/utilities */
+@layer components {
+  .card-panel {
+    min-height: 12rem;
+    max-height: 60vh;
+  }
+  .scroll-area {
+    overflow: auto;
+  }
+}
+
+/* Dark scrollbars for overflow containers */
+@layer utilities {
+  .scroll-dark::-webkit-scrollbar { width: 10px; height: 10px; }
+  .scroll-dark::-webkit-scrollbar-track { background: rgba(2,6,23,0.6); }
+  .scroll-dark::-webkit-scrollbar-thumb {
+    background: rgba(51,65,85,0.7);
+    border-radius: 8px;
+    border: 2px solid rgba(2,6,23,0.6);
+  }
+  .scroll-dark::-webkit-scrollbar-thumb:hover { background: rgba(100,116,139,0.7); }
+
+  /* Unified max-heights */
+  .panel-table-60 { max-height: 60vh; }
+  .panel-chart-45 { max-height: 45vh; }
+}

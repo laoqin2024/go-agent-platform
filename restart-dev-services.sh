@@ -61,14 +61,14 @@ echo "[restart] stopping old servers (by ports)"
 kill_port "${BACKEND_PORT}"
 kill_port "${FRONTEND_PORT}"
 
-echo "[restart] starting backend (go run ./cmd/server)"
+echo "[restart] starting backend (go run ./cmd/server) [后台模式，详细日志在 ${BACKEND_LOG}]"
 cd "${ROOT_DIR}"
 rm -f "${BACKEND_LOG}"
 go run ./cmd/server --addr "${BACKEND_ADDR}" --redis-addr "${REDIS_ADDR}" > "${BACKEND_LOG}" 2>&1 &
 BACKEND_PID=$!
 echo "[restart] backend pid: ${BACKEND_PID}, log: ${BACKEND_LOG}"
 
-echo "[restart] starting frontend (npm run dev in ./web)"
+echo "[restart] starting frontend (npm run dev in ./web) [后台模式，详细日志在 ${FRONTEND_LOG}]"
 cd "${ROOT_DIR}/web"
 if [[ ! -d "node_modules" ]]; then
   npm install

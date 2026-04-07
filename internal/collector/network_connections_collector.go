@@ -31,6 +31,7 @@ func (c *NetworkConnectionsCollector) CollectWithContext(ctx context.Context) (N
 	if err != nil {
 		return NetworkConnectionsSnapshot{}, err
 	}
+	conns = filterExternalEstablishedConns(conns)
 	return NetworkConnectionsSnapshot{
 		Connections: conns,
 		CollectedAt: time.Now(),

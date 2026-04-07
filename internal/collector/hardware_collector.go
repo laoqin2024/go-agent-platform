@@ -2,9 +2,12 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +34,7 @@ type HardwareDetails struct {
 	Mainboard     *MainboardInfo `json:"mainboard,omitempty"`
 	NetworkIfaces []NetworkIfaceInfo `json:"network_ifaces,omitempty"`
 	Partitions    []PartitionInfo    `json:"partitions,omitempty"`
+	SmartInfo     []DiskSmartInfo    `json:"smart_info,omitempty"`
 	CollectedAt   time.Time      `json:"collected_at"`
 }
 
@@ -236,10 +240,196 @@ func (h *HardwareCollector) CollectWithContext(ctx context.Context) (HardwareDet
 		h.logger.Debug("hardware: collectPartitions failed", "err", err)
 	}
 
+	if smart, err := collectDiskSmart(ctx, h.logger); err == nil {
+		out.SmartInfo = smart
+	} else if h.logger != nil {
+		h.logger.Debug("hardware: collectDiskSmart failed", "err", err)
+	}
+
 	h.mu.Lock()
 	h.cache = out
 	h.lastAt = now
 	h.mu.Unlock()
 
 	return out, nil
+}
+
+func collectDiskSmart(ctx context.Context, logger *slog.Logger) ([]DiskSmartInfo, error) {
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		return collectDiskSmartWithSmartctl(ctx, logger)
+	case "windows":
+		return collectDiskSmartWindows(ctx, logger)
+	default:
+		return nil, nil
+	}
+}
+
+func hwDebugEnabled() bool {
+	return strings.TrimSpace(os.Getenv("HW_DEBUG")) == "1"
+}
+
+// collectDiskSmartWithSmartctl uses smartctl -j -a to gather SMART info on Unix-like OSes.
+func collectDiskSmartWithSmartctl(ctx context.Context, logger *slog.Logger) ([]DiskSmartInfo, error) {
+	// smartctl can be slow; cap overall time.
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Discover devices via smartctl --scan-open
+	scanCmd := exec.CommandContext(sctx, "smartctl", "--scan-open")
+	out, err := scanCmd.Output()
+	if err != nil {
+		if hwDebugEnabled() && logger != nil {
+			logger.Debug("hardware: smartctl --scan-open failed", "err", err)
+		}
+		return nil, nil
+	}
+
+	lines := strings.Split(string(out), "\n")
+	var devs []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		dev := fields[0]
+		if strings.HasPrefix(dev, "/dev/") {
+			devs = append(devs, dev)
+		}
+	}
+	if len(devs) == 0 {
+		return nil, nil
+	}
+
+	type smartJSON struct {
+		ModelName string `json:"model_name"`
+		Device    struct {
+			Name string `json:"name"`
+		} `json:"device"`
+		SmartStatus struct {
+			Passed bool `json:"passed"`
+		} `json:"smart_status"`
+		Temperature struct {
+			Current int64 `json:"current"`
+		} `json:"temperature"`
+		PowerOnTime struct {
+			Hours int64 `json:"hours"`
+		} `json:"power_on_time"`
+	}
+
+	var outInfos []DiskSmartInfo
+
+	for _, dev := range devs {
+		devCtx, cancelDev := context.WithTimeout(sctx, 6*time.Second)
+		cmd := exec.CommandContext(devCtx, "smartctl", "-j", "-a", dev)
+		b, err := cmd.Output()
+		cancelDev()
+		if err != nil {
+			if hwDebugEnabled() && logger != nil {
+				logger.Debug("hardware: smartctl -j -a failed", "device", dev, "err", err)
+			}
+			continue
+		}
+
+		var sj smartJSON
+		if err := json.Unmarshal(b, &sj); err != nil {
+			if hwDebugEnabled() && logger != nil {
+				logger.Debug("hardware: smartctl json unmarshal failed", "device", dev, "err", err)
+			}
+			continue
+		}
+
+		deviceName := dev
+		if sj.Device.Name != "" {
+			deviceName = sj.Device.Name
+		}
+		model := sj.ModelName
+		status := "UNKNOWN"
+		if sj.SmartStatus.Passed {
+			status = "PASSED"
+		} else {
+			status = "FAILED"
+		}
+
+		info := DiskSmartInfo{
+			DeviceName:   deviceName,
+			Model:        model,
+			Status:       status,
+			Temperature:  sj.Temperature.Current,
+			PowerOnHours: sj.PowerOnTime.Hours,
+		}
+		outInfos = append(outInfos, info)
+
+		if hwDebugEnabled() && logger != nil {
+			logger.Info("[HW] Disk SMART (smartctl)",
+				"device", info.DeviceName,
+				"status", info.Status,
+				"temp_c", info.Temperature,
+				"power_on_hours", info.PowerOnHours,
+			)
+		}
+	}
+
+	return outInfos, nil
+}
+
+// collectDiskSmartWindows uses wmic to get basic health status on Windows.
+func collectDiskSmartWindows(ctx context.Context, logger *slog.Logger) ([]DiskSmartInfo, error) {
+	wctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(wctx, "wmic", "diskdrive", "get", "DeviceID,Model,Status")
+	out, err := cmd.Output()
+	if err != nil {
+		if hwDebugEnabled() && logger != nil {
+			logger.Debug("hardware: wmic diskdrive get failed", "err", err)
+		}
+		return nil, nil
+	}
+
+	lines := strings.Split(string(out), "\n")
+	if len(lines) <= 1 {
+		return nil, nil
+	}
+
+	var infos []DiskSmartInfo
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			continue
+		}
+		deviceID := parts[0]
+		statusRaw := parts[len(parts)-1]
+		model := strings.Join(parts[1:len(parts)-1], " ")
+
+		status := "UNKNOWN"
+		if strings.EqualFold(statusRaw, "OK") || strings.EqualFold(statusRaw, "PASSED") {
+			status = "PASSED"
+		} else if statusRaw != "" {
+			status = "FAILED"
+		}
+
+		info := DiskSmartInfo{
+			DeviceName: deviceID,
+			Model:      model,
+			Status:     status,
+		}
+		infos = append(infos, info)
+
+		if hwDebugEnabled() && logger != nil {
+			logger.Info("[HW] Disk SMART (wmic)",
+				"device", info.DeviceName,
+				"status", info.Status,
+			)
+		}
+	}
+	return infos, nil
 }

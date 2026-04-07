@@ -13,6 +13,7 @@ type AgentService struct {
 	logger *slog.Logger
 	runner Runner
 	dispatcher Runner
+	control Runner
 
 	stopTimeout time.Duration
 
@@ -50,6 +51,12 @@ func WithDispatcher(dispatcher Runner) AgentOption {
 	}
 }
 
+func WithControlRunner(control Runner) AgentOption {
+	return func(s *AgentService) {
+		s.control = control
+	}
+}
+
 // Start must be non-blocking. The run loop runs in a dedicated goroutine.
 func (s *AgentService) Start(_ kservice.Service) error {
 	s.mu.Lock()
@@ -67,6 +74,7 @@ func (s *AgentService) Start(_ kservice.Service) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	dispatcher := s.dispatcher
+	control := s.control
 	runner := s.runner
 	s.mu.Unlock()
 
@@ -86,6 +94,15 @@ func (s *AgentService) Start(_ kservice.Service) error {
 			s.logger.Info("agent service starting data dispatcher")
 			dispatcher.Run(runCtx)
 			s.logger.Info("data dispatcher goroutine exited")
+		}()
+	}
+	if control != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.logger.Info("agent service starting control runner")
+			control.Run(runCtx)
+			s.logger.Info("control runner goroutine exited")
 		}()
 	}
 
