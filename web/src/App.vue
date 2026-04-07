@@ -21,6 +21,9 @@ type DeviceInfo = {
   has_critical_risk?: boolean;
   had_critical_risk?: boolean;
   last_critical_at?: number;
+  agent_version?: string;
+  first_seen_at?: number;
+  agent_version_updated_at?: number;
 };
 
 type CurrentDevice = {
@@ -163,6 +166,8 @@ function updateDeviceMetaFromPayload(deviceId: string, payload: any) {
       if (ip) next.ip = ip;
       next.cpu_percent = toNum(hm?.cpu_total_percent ?? hm?.CPU?.Total);
       next.mem_used_percent = toNum(hm?.memory_used_percent ?? hm?.Memory?.UsedPercent);
+      if (typeof hm?.agent_version === "string" && hm.agent_version.trim()) next.agent_version = hm.agent_version.trim();
+      if (typeof hm?.AgentVersion === "string" && hm.AgentVersion.trim() && !next.agent_version) next.agent_version = hm.AgentVersion.trim();
     }
   }
   if (payload?.hardware_details) {

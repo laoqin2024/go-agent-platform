@@ -1,0 +1,129 @@
+- name: Deploy go-agent
+  hosts: agents
+  become: true
+  gather_facts: true
+  serial: "10%"
+  max_fail_percentage: 10
+
+  vars:
+    # Local build artifact on the control machine
+    # Resolved by target architecture (see tasks below)
+    agent_bin_local: ""
+    # Target path on remote hosts
+    agent_bin_path: "/usr/local/bin/go-agent"
+
+    agent_user: "goagent"
+    agent_group: "goagent"
+
+    # Required runtime args
+    agent_server_addr: "https://server.example.com:8443"
+    agent_control_token: "CHANGE_ME"
+
+    # Optional runtime args
+    agent_log_level: "info"
+    agent_extra_args: ""
+
+  tasks:
+    - name: Resolve local binary path by target architecture
+      ansible.builtin.set_fact:
+        agent_bin_local: >-
+          {{
+            "./dist/go-agent-amd64" if (ansible_facts.architecture in ["x86_64", "amd64"])
+            else "./dist/go-agent-arm64" if (ansible_facts.architecture in ["aarch64", "arm64"])
+            else ""
+          }}
+
+    - name: Fail if architecture is unsupported
+      ansible.builtin.fail:
+        msg: "Unsupported architecture '{{ ansible_facts.architecture }}'. Expected x86_64/amd64 or aarch64/arm64."
+      when: agent_bin_local | length == 0
+
+    - name: Ensure group exists
+      ansible.builtin.group:
+        name: "{{ agent_group }}"
+        system: true
+
+    - name: Ensure user exists
+      ansible.builtin.user:
+        name: "{{ agent_user }}"
+        group: "{{ agent_group }}"
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Install setcap provider (Debian/Ubuntu)
+      ansible.builtin.apt:
+        name: libcap2-bin
+        state: present
+        update_cache: true
+      when: ansible_facts.os_family == "Debian"
+
+    - name: Install setcap provider (RHEL/CentOS/Rocky/Alma)
+      ansible.builtin.yum:
+        name: libcap
+        state: present
+      when: ansible_facts.os_family == "RedHat"
+
+    - name: Upload go-agent binary
+      ansible.builtin.copy:
+        src: "{{ agent_bin_local }}"
+        dest: "{{ agent_bin_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart go-agent
+
+    - name: Read current file capabilities (if any)
+      ansible.builtin.command: "getcap {{ agent_bin_path }}"
+      register: getcap_out
+      changed_when: false
+      failed_when: false
+
+    - name: Allow non-root bind privileged ports via setcap (cap_net_bind_service)
+      ansible.builtin.command: "setcap cap_net_bind_service=+ep {{ agent_bin_path }}"
+      when: getcap_out.rc != 0 or ('cap_net_bind_service=ep' not in getcap_out.stdout and 'cap_net_bind_service=+ep' not in getcap_out.stdout)
+      notify: Restart go-agent
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: "templates/go-agent.service.j2"
+        dest: "/etc/systemd/system/go-agent.service"
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Systemd daemon-reload
+        - Restart go-agent
+
+    - name: Enable and start service
+      ansible.builtin.systemd:
+        name: go-agent
+        enabled: true
+        state: started
+
+    - name: Wait 5 seconds for warmup
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Check service is active
+      ansible.builtin.command: "systemctl is-active go-agent"
+      register: svc_active
+      changed_when: false
+      failed_when: svc_active.stdout.strip() != "active"
+
+    - name: Check process exists
+      ansible.builtin.command: "pgrep -f '{{ agent_bin_path }}'"
+      register: pgrep_out
+      changed_when: false
+      failed_when: pgrep_out.rc != 0
+
+  handlers:
+    - name: Systemd daemon-reload
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart go-agent
+      ansible.builtin.systemd:
+        name: go-agent
+        state: restarted
+

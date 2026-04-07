@@ -17,6 +17,9 @@ type Props = {
     has_critical_risk?: boolean;
     had_critical_risk?: boolean;
     last_critical_at?: number;
+    agent_version?: string;
+    first_seen_at?: number;
+    agent_version_updated_at?: number;
   }>;
   selectedDeviceId: string;
   updateTrigger?: number; // force recompute on external signals
@@ -152,6 +155,15 @@ function timeAgo(sec?: number) {
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
 }
+
+function isDeployAnomaly(d: Row): boolean {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const updatedAt = Number(d?.agent_version_updated_at ?? 0);
+  if (!updatedAt || updatedAt <= 0) return false;
+  // Mark as anomaly if a version rollout/update happened but device is still offline after 10 minutes.
+  const age = nowSec - updatedAt;
+  return d.online === false && age >= 600;
+}
 </script>
 
 <template>
@@ -247,6 +259,13 @@ function timeAgo(sec?: number) {
                     title="离线前存在风险（最后一次安全快照检测到 CRITICAL）"
                   >
                     离线前存在风险
+                  </span>
+                  <span
+                    v-if="isDeployAnomaly(d)"
+                    class="text-[10px] px-2 py-0.5 rounded border border-fuchsia-700 bg-fuchsia-500/10 text-fuchsia-200 font-mono"
+                    title="版本更新后超过 10 分钟仍未恢复在线，可能部署异常"
+                  >
+                    部署异常
                   </span>
                 </div>
                 <div class="text-[11px] text-slate-500 truncate mt-0.5">

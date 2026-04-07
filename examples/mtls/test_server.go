@@ -15,9 +15,9 @@ import (
 func main() {
 	var (
 		addr       = flag.String("addr", ":8443", "listen address, e.g. :8443")
-		caPath     = flag.String("ca", "./certs/ca.pem", "CA root certificate (PEM) used to verify client cert")
-		serverCert = flag.String("server-cert", "./certs/server.pem", "server certificate (PEM)")
-		serverKey  = flag.String("server-key", "./certs/server-key.pem", "server private key (PEM)")
+		caPath     = flag.String("ca", "./examples/certs/ca.pem", "CA root certificate (PEM) used to verify client cert")
+		serverCert = flag.String("server-cert", "./examples/certs/server.pem", "server certificate (PEM)")
+		serverKey  = flag.String("server-key", "./examples/certs/server-key.pem", "server private key (PEM)")
 		path       = flag.String("path", "/ingest", "HTTP ingest path")
 	)
 	flag.Parse()

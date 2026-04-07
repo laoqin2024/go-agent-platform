@@ -1,0 +1,22 @@
+[Unit]
+Description=Go Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ agent_user }}
+Group={{ agent_group }}
+ExecStart={{ agent_bin_path }} -server-addr {{ agent_server_addr }} -control-token {{ agent_control_token }} -device-id {{ inventory_hostname }} -log-level {{ agent_log_level }} {{ agent_extra_args }}
+Restart=always
+RestartSec=2
+MemoryAccounting=yes
+MemoryMax=128M
+CPUAccounting=yes
+CPUQuota=10%
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+

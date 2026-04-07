@@ -1,0 +1,28 @@
+agent_version:
+  latest_version: "v1.0.1"
+  download_url: "http://intranet-cdn.local/go-agent/releases/go-agent-v1.0.1"
+  md5: "replace-with-real-md5"
+  sha256: "replace-with-real-sha256"
+  rollout_pct: 10
+  artifacts:
+    - os: "linux"
+      arch: "amd64"
+      latest_version: "v1.0.1"
+      download_url: "http://intranet-cdn.local/go-agent/releases/go-agent-linux-amd64-v1.0.1"
+      md5: "replace-with-real-linux-amd64-md5"
+      sha256: "replace-with-real-linux-amd64-sha256"
+      rollout_pct: 10
+    - os: "linux"
+      arch: "arm64"
+      latest_version: "v1.0.1"
+      download_url: "http://intranet-cdn.local/go-agent/releases/go-agent-linux-arm64-v1.0.1"
+      md5: "replace-with-real-linux-arm64-md5"
+      sha256: "replace-with-real-linux-arm64-sha256"
+      rollout_pct: 10
+    - os: "windows"
+      arch: "amd64"
+      latest_version: "v1.0.1"
+      download_url: "http://intranet-cdn.local/go-agent/releases/go-agent-windows-amd64-v1.0.1.exe"
+      md5: "replace-with-real-windows-amd64-md5"
+      sha256: "replace-with-real-windows-amd64-sha256"
+      rollout_pct: 10

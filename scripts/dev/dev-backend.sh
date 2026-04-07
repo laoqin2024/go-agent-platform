@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # 开发环境：只启动 Go 后端（前端单独用 dev-frontend.sh）
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BACKEND_PORT="${BACKEND_PORT:-8080}"
 BACKEND_ADDR="${BACKEND_ADDR:-0.0.0.0:${BACKEND_PORT}}"
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6379}"

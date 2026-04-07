@@ -8,6 +8,11 @@ type DeviceInfo = {
   device_id: string;
   online?: boolean;
   has_critical_risk?: boolean;
+  os?: string;
+  ip?: string;
+  agent_version?: string;
+  first_seen_at?: number;
+  agent_version_updated_at?: number;
 };
 
 type VersionCount = {
@@ -49,17 +54,93 @@ const chartRef = ref<HTMLElement | null>(null);
 let chart: echarts.ECharts | null = null;
 let tick: number | null = null;
 
+const osChartRef = ref<HTMLElement | null>(null);
+let osChart: echarts.ECharts | null = null;
+
 const VULNERABILITY_RULES = [
   { name: "OpenSSL", version_lt: "3.0.7" },
   { name: "log4j", version_lt: "2.17.1" },
   { name: "Git", version_eq: "2.53.0" },
 ];
 
+const LATEST_AGENT_VERSION = "v1.0.1";
+
 const onlineDeviceCount = computed(() => (props.devices || []).filter((d) => d.online === true).length);
 const exposedPublicPortCount = computed(
   () => (props.devices || []).filter((d) => d.online === true && d.has_critical_risk === true).length
 );
 const selectedSoftware = computed(() => summary.value.find((it) => it.name === selectedName.value) || null);
+
+const fleetTotalCount = computed(() => (props.devices || []).length);
+const latestVersionCount = computed(
+  () => (props.devices || []).filter((d) => String(d.agent_version || "").trim() === LATEST_AGENT_VERSION).length
+);
+const latestVersionPct = computed(() => {
+  const total = fleetTotalCount.value || 0;
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((latestVersionCount.value / total) * 100)));
+});
+
+const newDevices5mCount = computed(() => {
+  const nowSec = Math.floor(nowMs.value / 1000);
+  return (props.devices || []).filter((d) => {
+    const t = Number(d.first_seen_at ?? 0);
+    return t > 0 && nowSec - t >= 0 && nowSec - t <= 300;
+  }).length;
+});
+
+const deployAnomalyCount = computed(() => {
+  const nowSec = Math.floor(nowMs.value / 1000);
+  return (props.devices || []).filter((d) => {
+    const t = Number(d.agent_version_updated_at ?? 0);
+    if (!t || t <= 0) return false;
+    const age = nowSec - t;
+    return d.online === false && age >= 600;
+  }).length;
+});
+
+function normOSName(os?: string): "windows" | "linux" | "other" {
+  const s = String(os || "").toLowerCase();
+  if (s.includes("windows")) return "windows";
+  if (s.includes("linux")) return "linux";
+  return "other";
+}
+
+const osCounts = computed(() => {
+  let windows = 0;
+  let linux = 0;
+  let other = 0;
+  for (const d of props.devices || []) {
+    const t = normOSName(d.os);
+    if (t === "windows") windows++;
+    else if (t === "linux") linux++;
+    else other++;
+  }
+  return { windows, linux, other };
+});
+
+const deployStartAtMs = ref(0);
+const expectedDeployTargets = computed(() => {
+  const raw = String((import.meta as any)?.env?.VITE_DEPLOY_TARGETS || "").trim();
+  if (!raw) return [] as string[];
+  const parts = raw
+    .split(/[,\n;]/g)
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+  // unique
+  return Array.from(new Set(parts));
+});
+
+const missingTargets = computed(() => {
+  const start = deployStartAtMs.value || 0;
+  if (!start) return [] as string[];
+  const elapsedSec = Math.floor((nowMs.value - start) / 1000);
+  if (elapsedSec < 600) return [] as string[];
+  const targets = expectedDeployTargets.value;
+  if (targets.length === 0) return [] as string[];
+  const ips = new Set((props.devices || []).map((d) => String(d.ip || "").trim()).filter(Boolean));
+  return targets.filter((t) => !ips.has(String(t).trim()));
+});
 
 const summaryAgoSec = computed(() =>
   summaryFetchedAt.value > 0 ? Math.max(0, Math.floor((nowMs.value - summaryFetchedAt.value) / 1000)) : 0
@@ -218,6 +299,11 @@ function ensureChart() {
   if (!chart) chart = echarts.init(chartRef.value, undefined, { renderer: "canvas" });
 }
 
+function ensureOSChart() {
+  if (!osChartRef.value) return;
+  if (!osChart) osChart = echarts.init(osChartRef.value, undefined, { renderer: "canvas" });
+}
+
 function renderChart() {
   ensureChart();
   if (!chart) return;
@@ -246,26 +332,62 @@ function renderChart() {
   });
 }
 
+function renderOSChart() {
+  ensureOSChart();
+  if (!osChart) return;
+  const { windows, linux, other } = osCounts.value;
+  const data = [
+    { name: "Windows", value: windows, itemStyle: { color: "#60a5fa" } },
+    { name: "Linux", value: linux, itemStyle: { color: "#22d3ee" } },
+  ];
+  if (other > 0) {
+    data.push({ name: "Other", value: other, itemStyle: { color: "#a78bfa" } });
+  }
+  osChart.setOption({
+    backgroundColor: "transparent",
+    tooltip: { trigger: "item" },
+    legend: { top: 8, left: 8, textStyle: { color: "#94a3b8" } },
+    series: [
+      {
+        type: "pie",
+        radius: ["45%", "70%"],
+        center: ["50%", "58%"],
+        avoidLabelOverlap: true,
+        label: { color: "#cbd5e1", formatter: "{b}: {d}%" },
+        labelLine: { lineStyle: { color: "#475569" } },
+        data,
+      },
+    ],
+  });
+}
+
 watch(selectedSoftware, () => nextTick(() => renderChart()));
 watch(
   () => summary.value,
   () => nextTick(() => renderChart()),
   { deep: true }
 );
+watch(osCounts, () => nextTick(() => renderOSChart()), { deep: true });
 
 onMounted(() => {
   void refreshAll();
+  deployStartAtMs.value = Date.now();
   tick = window.setInterval(() => {
     nowMs.value = Date.now();
   }, 1000);
   window.addEventListener("resize", renderChart);
+  window.addEventListener("resize", renderOSChart);
+  nextTick(() => renderOSChart());
 });
 
 onUnmounted(() => {
   if (tick != null) window.clearInterval(tick);
   window.removeEventListener("resize", renderChart);
+  window.removeEventListener("resize", renderOSChart);
   chart?.dispose();
   chart = null;
+  osChart?.dispose();
+  osChart = null;
 });
 </script>
 
@@ -276,7 +398,7 @@ onUnmounted(() => {
     </div>
 
     <div class="h-full p-4 flex flex-col gap-4">
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
         <div class="card-base card-padding">
           <div class="text-xs text-slate-400">在线设备总数</div>
           <div class="text-2xl font-mono text-cyan-300 mt-1">{{ onlineDeviceCount }}</div>
@@ -288,6 +410,74 @@ onUnmounted(() => {
         <div class="card-base card-padding">
           <div class="text-xs text-slate-400">暴露公网端口数</div>
           <div class="text-2xl font-mono text-amber-300 mt-1">{{ exposedPublicPortCount }}</div>
+        </div>
+        <div class="card-base card-padding">
+          <div class="flex items-center justify-between">
+            <div class="text-xs text-slate-400">部署实时看板</div>
+            <div class="text-[11px] text-slate-500 font-mono">{{ LATEST_AGENT_VERSION }}</div>
+          </div>
+
+          <div class="mt-2">
+            <div class="flex items-center justify-between text-[11px] text-slate-400">
+              <span>版本进度</span>
+              <span class="font-mono text-slate-300">{{ latestVersionCount }}/{{ fleetTotalCount }}（{{ latestVersionPct }}%）</span>
+            </div>
+            <div class="mt-1 h-2 rounded bg-slate-900/70 border border-slate-800 overflow-hidden">
+              <div
+                class="h-full bg-emerald-400/80"
+                :style="{ width: latestVersionPct + '%' }"
+              ></div>
+            </div>
+          </div>
+
+          <div class="mt-2 grid grid-cols-2 gap-2">
+            <div class="rounded border border-slate-800 bg-slate-900/30 px-2 py-1">
+              <div class="text-[10px] text-slate-500">过去 5 分钟新注册</div>
+              <div class="text-lg font-mono text-sky-300">{{ newDevices5mCount }}</div>
+            </div>
+            <div class="rounded border border-slate-800 bg-slate-900/30 px-2 py-1">
+              <div class="text-[10px] text-slate-500">部署异常（离线 ≥10m）</div>
+              <div class="text-lg font-mono" :class="deployAnomalyCount > 0 ? 'text-fuchsia-200' : 'text-slate-300'">
+                {{ deployAnomalyCount }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 xl:grid-cols-5 gap-4">
+        <div class="xl:col-span-2 card-base card-padding min-h-0 flex flex-col">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm text-slate-300">系统类型统计</div>
+            <div class="text-[11px] text-slate-500 font-mono">
+              Win {{ osCounts.windows }} · Linux {{ osCounts.linux }}<span v-if="osCounts.other"> · Other {{ osCounts.other }}</span>
+            </div>
+          </div>
+          <div ref="osChartRef" class="flex-1 min-h-[220px]"></div>
+        </div>
+
+        <div class="xl:col-span-3 card-base card-padding min-h-0">
+          <div class="flex items-center justify-between">
+            <div class="text-sm text-slate-300">异常提醒</div>
+            <div class="text-[11px] text-slate-500">
+              <span v-if="expectedDeployTargets.length === 0">未配置 VITE_DEPLOY_TARGETS</span>
+              <span v-else>Inventory {{ expectedDeployTargets.length }} 台</span>
+            </div>
+          </div>
+          <div class="mt-1 text-[11px] text-slate-500">
+            规则：清单内目标在部署开始后 10 分钟内未在后端注册（按 IP 匹配 devices.ip）则列为异常
+          </div>
+          <div class="mt-2 border border-slate-800 rounded bg-slate-900/20 max-h-32 overflow-auto scroll-dark">
+            <div v-if="missingTargets.length === 0" class="px-3 py-3 text-sm text-slate-500">
+              暂无异常目标
+            </div>
+            <div v-else class="divide-y divide-slate-800/70">
+              <div v-for="ip in missingTargets" :key="ip" class="px-3 py-2 flex items-center justify-between">
+                <div class="font-mono text-fuchsia-200">{{ ip }}</div>
+                <div class="text-[11px] text-slate-500">未注册 ≥10m</div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 

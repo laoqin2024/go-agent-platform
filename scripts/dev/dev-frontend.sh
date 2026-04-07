@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # 开发环境：只启动前端 Vite（后端单独用 dev-backend.sh）
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 FRONTEND_LOG="${FRONTEND_LOG:-/tmp/go-agent-web.log}"
 

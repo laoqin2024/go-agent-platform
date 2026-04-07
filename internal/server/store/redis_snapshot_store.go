@@ -120,6 +120,32 @@ func (s *RedisSnapshotStore) SaveSnapshot(ctx context.Context, snap model.Snapsh
 	if prevRaw, err := s.client.HGet(ctx, s.metaKey, snap.DeviceID).Result(); err == nil && strings.TrimSpace(prevRaw) != "" {
 		var prev storedMeta
 		if json.Unmarshal([]byte(prevRaw), &prev) == nil {
+			// Preserve first_seen_at (only set once).
+			if prev.FirstSeenAtSec > 0 && meta.FirstSeenAtSec == 0 {
+				meta.FirstSeenAtSec = prev.FirstSeenAtSec
+			}
+			// Preserve agent_version if current meta can't parse it (older agents).
+			if meta.AgentVersion == "" && prev.AgentVersion != "" {
+				meta.AgentVersion = prev.AgentVersion
+			}
+			// Update agent_version_updated_at only when version changes; otherwise preserve.
+			if meta.AgentVersion != "" {
+				if prev.AgentVersion != "" && strings.EqualFold(strings.TrimSpace(prev.AgentVersion), strings.TrimSpace(meta.AgentVersion)) {
+					if prev.AgentVersionUpdatedAtSec > 0 {
+						meta.AgentVersionUpdatedAtSec = prev.AgentVersionUpdatedAtSec
+					}
+				} else {
+					// Version changed (or first time we see it)
+					if snap.UpdatedAtSec > 0 {
+						meta.AgentVersionUpdatedAtSec = snap.UpdatedAtSec
+					} else {
+						meta.AgentVersionUpdatedAtSec = time.Now().Unix()
+					}
+				}
+			} else if prev.AgentVersionUpdatedAtSec > 0 {
+				meta.AgentVersionUpdatedAtSec = prev.AgentVersionUpdatedAtSec
+			}
+
 			// Preserve historical risk flags.
 			if prev.HadCriticalRisk {
 				meta.HadCriticalRisk = true
@@ -127,6 +153,14 @@ func (s *RedisSnapshotStore) SaveSnapshot(ctx context.Context, snap model.Snapsh
 			if meta.LastCriticalAtSec == 0 && prev.LastCriticalAtSec > 0 {
 				meta.LastCriticalAtSec = prev.LastCriticalAtSec
 			}
+		}
+	}
+	// If first_seen_at still empty, initialize now (or by snapshot timestamp).
+	if meta.FirstSeenAtSec == 0 {
+		if snap.UpdatedAtSec > 0 {
+			meta.FirstSeenAtSec = snap.UpdatedAtSec
+		} else {
+			meta.FirstSeenAtSec = time.Now().Unix()
 		}
 	}
 	metaBytes, err := json.Marshal(meta)
@@ -154,6 +188,11 @@ type storedMeta struct {
 	CPUPercent   float64 `json:"cpu_percent,omitempty"`
 	MemUsedPct   float64 `json:"mem_used_percent,omitempty"`
 	UpdatedAtSec int64   `json:"updated_at,omitempty"`
+
+	// Deployment dashboard fields
+	AgentVersion             string `json:"agent_version,omitempty"`
+	FirstSeenAtSec           int64  `json:"first_seen_at,omitempty"`
+	AgentVersionUpdatedAtSec int64  `json:"agent_version_updated_at,omitempty"`
 
 	// Security risk summary (persisted across updates for "offline-before-risk" marker).
 	HasCriticalRisk   bool  `json:"has_critical_risk,omitempty"`
@@ -336,6 +375,16 @@ func buildDeviceMeta(snap model.SnapshotPush) storedMeta {
 			}
 			if mem, ok := obj["Memory"].(map[string]any); ok && meta.MemUsedPct == 0 {
 				meta.MemUsedPct = getFloatAny(mem["UsedPercent"])
+			}
+
+			// Best-effort: agent version string from host_metrics
+			for _, k := range []string{"agent_version", "AgentVersion"} {
+				if v, ok := obj[k]; ok {
+					if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+						meta.AgentVersion = strings.TrimSpace(s)
+						break
+					}
+				}
 			}
 		}
 	}
@@ -753,6 +802,15 @@ func (s *RedisSnapshotStore) ListDevices(ctx context.Context, onlineWithin time.
 					info.HasCriticalRisk = meta.HasCriticalRisk
 					info.HadCriticalRisk = meta.HadCriticalRisk
 					info.LastCriticalAtSec = meta.LastCriticalAtSec
+					if meta.AgentVersion != "" {
+						info.AgentVersion = meta.AgentVersion
+					}
+					if meta.FirstSeenAtSec > 0 {
+						info.FirstSeenAtSec = meta.FirstSeenAtSec
+					}
+					if meta.AgentVersionUpdatedAtSec > 0 {
+						info.AgentVersionUpdatedAtSec = meta.AgentVersionUpdatedAtSec
+					}
 					if meta.UpdatedAtSec > 0 {
 						updatedAt = meta.UpdatedAtSec
 						info.UpdatedAtSec = meta.UpdatedAtSec
@@ -813,6 +871,9 @@ func (s *RedisSnapshotStore) ListDevices(ctx context.Context, onlineWithin time.
 						CPUPercent:   info.CPUPercent,
 						MemUsedPct:   info.MemUsedPct,
 						UpdatedAtSec: info.UpdatedAtSec,
+						AgentVersion:             info.AgentVersion,
+						FirstSeenAtSec:           info.FirstSeenAtSec,
+						AgentVersionUpdatedAtSec: info.AgentVersionUpdatedAtSec,
 						HasCriticalRisk:   info.HasCriticalRisk,
 						HadCriticalRisk:   info.HadCriticalRisk,
 						LastCriticalAtSec: info.LastCriticalAtSec,

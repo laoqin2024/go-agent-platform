@@ -27,6 +27,7 @@ type RouterConfig struct {
 	DevicesHandler       *serverHandler.DevicesHandler
 	RiskWhitelistHandler *serverHandler.RiskWhitelistHandler
 	AssetsSearchHandler  *serverHandler.AssetsSearchHandler
+	AgentVersionHandler  *serverHandler.AgentVersionHandler
 }
 
 func NewRouter(cfg RouterConfig) *gin.Engine {
@@ -94,6 +95,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		if cfg.ControlHandler != nil {
 			api.POST("/control/:device_id", cfg.ControlHandler.PostControlCommand)
 			api.POST("/control/notify", cfg.ControlHandler.PostBatchNotify)
+		}
+		if cfg.AgentVersionHandler != nil {
+			api.GET("/agent/version", cfg.AgentVersionHandler.GetLatestAgentVersion)
 		}
 	}
 

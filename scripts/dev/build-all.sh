@@ -7,7 +7,7 @@ set -euo pipefail
 #   - dist/agent          (若存在 cmd/agent)
 #   - web/dist/           (前端打包产物)
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST_DIR="${DIST_DIR:-${ROOT_DIR}/dist}"
 # 交互式：若未指定则询问；非交互（CI）时通过环境变量控制
 BUILD_WINDOWS="${BUILD_WINDOWS:-ask}"   # ask|0|1

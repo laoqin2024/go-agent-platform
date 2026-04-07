@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 BACKEND_ADDR="${BACKEND_ADDR:-0.0.0.0:8080}"
 REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:6379}"

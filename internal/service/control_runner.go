@@ -23,6 +23,7 @@ type ControlRunner struct {
 	token           string
 	allowedScripts  map[string]struct{}
 	allowedServices map[string]struct{}
+	updater         interface{ TriggerNow() }
 }
 
 type controlMessage struct {
@@ -38,6 +39,12 @@ type executionResult struct {
 	Type        string `json:"type"`
 	CommandID   string `json:"command_id"`
 	ExitCode    int    `json:"exit_code"`
+	StdoutBrief string `json:"stdout_brief,omitempty"`
+}
+
+type executionProgress struct {
+	Type        string `json:"type"`
+	CommandID   string `json:"command_id"`
 	StdoutBrief string `json:"stdout_brief,omitempty"`
 }
 
@@ -64,6 +71,17 @@ func NewControlRunner(logger *slog.Logger, deviceID, apiURL, token string, allow
 		allowedScripts:  toSet(allowedScripts, []string{"clean_cache", "restart_monitor"}),
 		allowedServices: toSet(allowedServices, []string{"go-agent"}),
 	}
+}
+
+func NewControlRunnerWithUpdater(
+	logger *slog.Logger,
+	deviceID, apiURL, token string,
+	allowedScripts, allowedServices []string,
+	updater interface{ TriggerNow() },
+) *ControlRunner {
+	r := NewControlRunner(logger, deviceID, apiURL, token, allowedScripts, allowedServices)
+	r.updater = updater
+	return r
 }
 
 func (r *ControlRunner) Run(ctx context.Context) {
@@ -172,6 +190,13 @@ func (r *ControlRunner) runOnce(ctx context.Context) error {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(msg.Command), "force_update") {
+			_ = safeWriteJSON(executionProgress{
+				Type:        "execution_progress",
+				CommandID:   strings.TrimSpace(msg.CommandID),
+				StdoutBrief: "正在更新...",
+			})
+		}
 		exitCode, out := r.handleCommand(ctx, msg)
 		_ = safeWriteJSON(executionResult{
 			Type:        "execution_result",
@@ -202,6 +227,12 @@ func (r *ControlRunner) handleCommand(ctx context.Context, msg controlMessage) (
 		return r.restartService(ctx, service)
 	case "shutdown":
 		return 1, "shutdown disabled by policy"
+	case "force_update":
+		if r.updater == nil {
+			return 1, "update runner unavailable"
+		}
+		r.updater.TriggerNow()
+		return 0, "正在更新..."
 	default:
 		return 1, "unsupported command"
 	}

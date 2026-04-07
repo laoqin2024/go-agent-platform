@@ -19,6 +19,9 @@ type SimCollector struct {
 	hostEvery    time.Duration
 	host         *collector.HostCollector
 
+	// agentVersion is a build-time version string injected by cmd/agent (e.g. v1.0.1).
+	agentVersion string
+
 	hardware *collector.HardwareCollector
 
 	processSnapshot *collector.ProcessSnapshotCollector
@@ -57,6 +60,12 @@ type SimCollector struct {
 }
 
 type SimCollectorOption func(*SimCollector)
+
+func WithAgentVersion(v string) SimCollectorOption {
+	return func(c *SimCollector) {
+		c.agentVersion = v
+	}
+}
 
 func WithSoftwareScanEvery(d time.Duration) SimCollectorOption {
 	return func(c *SimCollector) {
@@ -108,6 +117,7 @@ func NewSimCollector(logger *slog.Logger, collectEvery time.Duration, buf *buffe
 		logger:       logger,
 		hostEvery:    hostEvery,
 		host:         collector.NewHostCollector(collector.WithCollectTimeout(hostEvery - 50*time.Millisecond)),
+		agentVersion: "",
 		hardware:     collector.NewHardwareCollector(collector.WithHardwareLogger(logger)),
 		processSnapshot: collector.NewProcessSnapshotCollector(),
 		security:        collector.NewSecurityCollector(),
@@ -173,6 +183,10 @@ func (c *SimCollector) Run(ctx context.Context) {
 			if err != nil {
 				c.logger.Warn("collection engine: failed to collect host metrics", "err", err, "ts", t.Format(time.RFC3339))
 				continue
+			}
+			// Attach agent version for deployment dashboard / fleet rollout insights.
+			if c.agentVersion != "" {
+				metrics.AgentVersion = c.agentVersion
 			}
 			if c.buffer != nil {
 				payload, err := json.Marshal(metrics)

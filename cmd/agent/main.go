@@ -32,6 +32,7 @@ var (
 func main() {
 	var (
 		debug              = flag.Bool("debug", false, "run agent in debug mode (foreground) and stop on Ctrl+C")
+		agentVersion       = flag.String("version", Version, "agent runtime version reported in metrics and used for auto-update compare")
 		logLevel           = flag.String("log-level", "info", "log level: debug|info|warn|error")
 		collectEvery       = flag.Duration("collect-every", 2*time.Second, "interval for simulated device collection")
 		stopTimeout        = flag.Duration("stop-timeout", 10*time.Second, "timeout waiting for graceful stop")
@@ -53,8 +54,11 @@ func main() {
 
 	logger := internalservice.NewLogger(*logLevel)
 
+	if strings.TrimSpace(*agentVersion) == "" {
+		*agentVersion = Version
+	}
 	logger.Info("agent starting",
-		"version", Version,
+		"version", *agentVersion,
 		"buildTime", BuildTime,
 		"gitCommit", GitCommit,
 		"dataDir", *dataDir,
@@ -70,7 +74,7 @@ func main() {
 		_ = cache.Close()
 	}()
 
-	engine := internalservice.NewSimCollector(logger, *collectEvery, cache)
+	engine := internalservice.NewSimCollector(logger, *collectEvery, cache, internalservice.WithAgentVersion(*agentVersion))
 	runForeground := *debug || (runtime.GOOS == "windows" && kservice.Interactive())
 	if runForeground {
 		// In debug mode, retry hardware scan frequently so hardware_details shows up quickly
@@ -79,6 +83,7 @@ func main() {
 			logger,
 			*collectEvery,
 			cache,
+			internalservice.WithAgentVersion(*agentVersion),
 			internalservice.WithHardwareScanEvery(2*time.Minute),
 			internalservice.WithHardwareRetryAfter(30*time.Second),
 		)
@@ -118,13 +123,25 @@ func main() {
 			controlDeviceID = hw.Fingerprint
 		}
 	}
-	controlRunner := internalservice.NewControlRunner(
+	updateRunner := internalservice.NewUpdateRunner(
+		logger,
+		*agentVersion,
+		*apiURL,
+		controlDeviceID,
+		*serviceName,
+		*caCertPath,
+		*clientCert,
+		*clientKey,
+		*insecureSkipVerify,
+	)
+	controlRunner := internalservice.NewControlRunnerWithUpdater(
 		logger,
 		controlDeviceID,
 		*apiURL,
 		*controlToken,
 		splitCSV(*allowedScripts),
 		splitCSV(*allowedServices),
+		updateRunner,
 	)
 	wrapper := internalservice.NewAgentService(
 		engine,
@@ -132,6 +149,7 @@ func main() {
 		internalservice.WithStopTimeout(*stopTimeout),
 		internalservice.WithDispatcher(dispatcher),
 		internalservice.WithControlRunner(controlRunner),
+		internalservice.WithUpdateRunner(updateRunner),
 	)
 
 	if runForeground {

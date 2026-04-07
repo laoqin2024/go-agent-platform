@@ -57,9 +57,13 @@ LDFLAGS := -s -w \
 GOFLAGS ?= -mod=readonly
 CGO_ENABLED ?= 0
 
-.PHONY: all build-windows build-linux build-darwin clean
+.PHONY: all build-windows build-linux build-darwin build-server clean
 
 all: build-windows build-linux build-darwin
+
+build-server:
+	mkdir -p '$(DIST_DIR)'
+	CGO_ENABLED=$(CGO_ENABLED) go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o '$(DIST_DIR)/go-agent-server' ./cmd/server
 
 clean:
 	rm -rf '$(DIST_DIR)'

@@ -14,6 +14,7 @@ type AgentService struct {
 	runner Runner
 	dispatcher Runner
 	control Runner
+	update  Runner
 
 	stopTimeout time.Duration
 
@@ -57,6 +58,12 @@ func WithControlRunner(control Runner) AgentOption {
 	}
 }
 
+func WithUpdateRunner(update Runner) AgentOption {
+	return func(s *AgentService) {
+		s.update = update
+	}
+}
+
 // Start must be non-blocking. The run loop runs in a dedicated goroutine.
 func (s *AgentService) Start(_ kservice.Service) error {
 	s.mu.Lock()
@@ -75,6 +82,7 @@ func (s *AgentService) Start(_ kservice.Service) error {
 	s.cancel = cancel
 	dispatcher := s.dispatcher
 	control := s.control
+	update := s.update
 	runner := s.runner
 	s.mu.Unlock()
 
@@ -103,6 +111,15 @@ func (s *AgentService) Start(_ kservice.Service) error {
 			s.logger.Info("agent service starting control runner")
 			control.Run(runCtx)
 			s.logger.Info("control runner goroutine exited")
+		}()
+	}
+	if update != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.logger.Info("agent service starting update runner")
+			update.Run(runCtx)
+			s.logger.Info("update runner goroutine exited")
 		}()
 	}
 

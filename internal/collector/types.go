@@ -59,6 +59,8 @@ type NetworkInterfaceStats struct {
 type HostMetrics struct {
 	Hostname    string `json:"hostname"`
 	Fingerprint string `json:"fingerprint"`
+	// AgentVersion is the build-time version of go-agent (e.g. v1.0.1). Filled by the agent runtime.
+	AgentVersion string `json:"agent_version,omitempty"`
 	CPU         CPUStats
 	Memory      MemoryStats
 	Disk        DiskStats

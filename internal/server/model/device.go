@@ -13,6 +13,11 @@ type DeviceInfo struct {
 	UpdatedAtSec int64   `json:"updated_at,omitempty"`
 	Online       bool    `json:"online"`
 
+	// Deployment dashboard fields
+	AgentVersion            string `json:"agent_version,omitempty"`
+	FirstSeenAtSec          int64  `json:"first_seen_at,omitempty"`
+	AgentVersionUpdatedAtSec int64 `json:"agent_version_updated_at,omitempty"`
+
 	// Risk summary for device list UI (derived from latest security_snapshot).
 	HasCriticalRisk   bool  `json:"has_critical_risk,omitempty"`   // currently critical (last snapshot)
 	HadCriticalRisk   bool  `json:"had_critical_risk,omitempty"`   // ever critical (persisted until TTL expiry)

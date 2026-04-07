@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	serverConfig "github.com/qinyilin/go-agent/internal/server/config"
 	"github.com/qinyilin/go-agent/internal/server/handler"
 	"github.com/qinyilin/go-agent/internal/server/notify"
 	"github.com/qinyilin/go-agent/internal/server/router"
@@ -35,6 +36,7 @@ func main() {
 		readTimeout   = flag.Duration("read-timeout", 10*time.Second, "http read timeout")
 		writeTimeout  = flag.Duration("write-timeout", 30*time.Second, "http write timeout")
 		idleTimeout   = flag.Duration("idle-timeout", 60*time.Second, "http idle timeout")
+		configPath    = flag.String("config", "config.yaml", "path to config yaml")
 	)
 	flag.Parse()
 
@@ -66,6 +68,13 @@ func main() {
 	devicesHandler := handler.NewDevicesHandler(snapshotStore)
 	riskWhitelistHandler := handler.NewRiskWhitelistHandler(snapshotStore)
 	assetsSearchHandler := handler.NewAssetsSearchHandler(snapshotStore)
+	var agentVersionCfg serverConfig.AgentVersionConfig
+	if cfg, err := serverConfig.LoadRootConfig(*configPath); err != nil {
+		logger.Warn("failed to load config yaml; agent/version endpoint may return 404", "path", *configPath, "err", err)
+	} else {
+		agentVersionCfg = cfg.AgentVersion
+	}
+	agentVersionHandler := handler.NewAgentVersionHandler(agentVersionCfg)
 
 	r := router.NewRouter(router.RouterConfig{
 		ReportHandler:        reportHandler,
@@ -75,6 +84,7 @@ func main() {
 		DevicesHandler:       devicesHandler,
 		RiskWhitelistHandler: riskWhitelistHandler,
 		AssetsSearchHandler:  assetsSearchHandler,
+		AgentVersionHandler:  agentVersionHandler,
 	})
 
 	httpServer := &http.Server{

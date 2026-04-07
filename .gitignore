@@ -1,7 +1,11 @@
 # Local data / caches
+var/
 data/
 data_ui/
 **/agent_cache.db
+data_tmp/
+tmp/
+*.tmp
 
 # Build outputs / binaries
 dist/
@@ -21,9 +25,23 @@ log.txt
 *.log
 logs/
 *.out
+install_error.txt
+**/install_error.txt
+*.pid
 
 # Generated / local TLS material (do not commit private keys)
 certs/
+examples/certs/
+*.pem
+*.key
+*.crt
+*.cer
+*.csr
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
 
 # OS files
 .DS_Store
@@ -57,6 +75,14 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Local config overrides (keep config.yaml as example, do not commit real prod configs)
+config.local.yaml
+config.local.yml
+config.prod.yaml
+config.prod.yml
+config.secret.yaml
+config.secret.yml
 
 # Do not sync screenshots/images
 image/
