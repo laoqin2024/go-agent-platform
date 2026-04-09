@@ -17,6 +17,7 @@ import (
 	"github.com/qinyilin/go-agent/internal/server/router"
 	"github.com/qinyilin/go-agent/internal/server/store"
 	"github.com/qinyilin/go-agent/internal/server/ws"
+	"github.com/qinyilin/go-agent/internal/server/usb"
 )
 
 // @title           2000台规模设备监控平台 API
@@ -53,6 +54,13 @@ func main() {
 
 	wsHub := ws.NewHub()
 	controlHub := ws.NewControlHub()
+	usbLogStore, err := store.NewUSBLogStore(strings.TrimSpace(os.Getenv("USB_LOG_DB_DSN")))
+	if err != nil {
+		logger.Warn("failed to init usb log db, usb logs will not persist to sqlite", "err", err)
+	}
+	if usbLogStore != nil {
+		defer usbLogStore.Close()
+	}
 	var notifierPlugin notify.Notifier
 	if webhookURL := strings.TrimSpace(os.Getenv("NOTIFY_WEBHOOK_URL")); webhookURL != "" {
 		if n, err := notify.NewWebhookNotifier(webhookURL); err == nil {
@@ -61,13 +69,16 @@ func main() {
 			logger.Warn("failed to init webhook notifier", "err", err)
 		}
 	}
-	reportHandler := handler.NewReportHandler(snapshotStore, wsHub, logger)
+	reportHandler := handler.NewReportHandler(snapshotStore, usbLogStore, wsHub, logger)
 	wsHandler := handler.NewWSHandler(snapshotStore, wsHub, logger)
 	controlHandler := handler.NewControlHandler(controlHub, logger, notifierPlugin, snapshotStore)
 	snapshotHandler := handler.NewDeviceSnapshotHandler(snapshotStore, logger)
 	devicesHandler := handler.NewDevicesHandler(snapshotStore)
 	riskWhitelistHandler := handler.NewRiskWhitelistHandler(snapshotStore)
 	assetsSearchHandler := handler.NewAssetsSearchHandler(snapshotStore)
+	usbManager := usb.NewManager(snapshotStore, usbLogStore, wsHub, logger)
+	usbHandler := handler.NewUSBHandler(usbManager)
+	reportHandler = reportHandler.WithUSBManager(usbManager)
 	var agentVersionCfg serverConfig.AgentVersionConfig
 	if cfg, err := serverConfig.LoadRootConfig(*configPath); err != nil {
 		logger.Warn("failed to load config yaml; agent/version endpoint may return 404", "path", *configPath, "err", err)
@@ -85,6 +96,7 @@ func main() {
 		RiskWhitelistHandler: riskWhitelistHandler,
 		AssetsSearchHandler:  assetsSearchHandler,
 		AgentVersionHandler:  agentVersionHandler,
+		USBHandler:           usbHandler,
 	})
 
 	httpServer := &http.Server{

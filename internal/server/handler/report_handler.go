@@ -19,19 +19,41 @@ import (
 	"github.com/qinyilin/go-agent/internal/collector"
 	"github.com/qinyilin/go-agent/internal/server/model"
 	"github.com/qinyilin/go-agent/internal/server/store"
+	"github.com/qinyilin/go-agent/internal/server/usb"
 	"github.com/qinyilin/go-agent/internal/server/ws"
 )
 
 type ReportHandler struct {
-	store  *store.RedisSnapshotStore
-	wsHub  *ws.Hub
-	logger *slog.Logger
+	store    *store.RedisSnapshotStore
+	usbStore *store.USBLogStore
+	wsHub    *ws.Hub
+	logger   *slog.Logger
+	usbMgr   usb.Service
 }
 
 // ApiBatchRequest is a Swagger-facing schema for /report batch ingest.
 // Real runtime parsing still uses ingestBatchRequest for compatibility.
 type ApiBatchRequest struct {
 	Items []ApiBatchItem `json:"items"`
+}
+
+// ApiReportSwaggerRequest documents /api/v1/report accepted payloads (direct + batch).
+// It exists mainly so Swagger can "see" model types like model.USBEvent and render them in the Models section.
+type ApiReportSwaggerRequest struct {
+	// Batch format (compat).
+	Items []ApiBatchItem `json:"items,omitempty"`
+
+	// Old direct-report format.
+	DeviceID     string          `json:"device_id,omitempty"`
+	// Use `any` so Swagger can render a generic schema (process snapshots can be huge/variable).
+	Processes    any `json:"processes,omitempty"`
+	SoftwareList any `json:"software_list,omitempty"`
+	// Backward-compatible: some agents may send a single event.
+	USBEvent      any `json:"usb_event,omitempty"`
+	ReportedAtSec int64           `json:"reported_at,omitempty"`
+
+	// Put this field near the end so Swagger UI tends to list this model near the bottom.
+	USBEvents []model.USBEvent `json:"usb_events,omitempty"`
 }
 
 // ApiBatchItem documents possible payload models by dataType.
@@ -44,12 +66,21 @@ type ApiBatchItem struct {
 	SecuritySnapshot *collector.SecuritySnapshot `json:"security_snapshot,omitempty"`
 }
 
-func NewReportHandler(snapshotStore *store.RedisSnapshotStore, wsHub *ws.Hub, logger *slog.Logger) *ReportHandler {
+func NewReportHandler(snapshotStore *store.RedisSnapshotStore, usbStore *store.USBLogStore, wsHub *ws.Hub, logger *slog.Logger) *ReportHandler {
 	return &ReportHandler{
-		store:  snapshotStore,
-		wsHub:  wsHub,
-		logger: logger,
+		store:    snapshotStore,
+		usbStore: usbStore,
+		wsHub:    wsHub,
+		logger:   logger,
 	}
+}
+
+// WithUSBManager injects a usb manager for decoupled USB handling and broadcasts.
+func (h *ReportHandler) WithUSBManager(m usb.Service) *ReportHandler {
+	if h != nil {
+		h.usbMgr = m
+	}
+	return h
 }
 
 // POST /api/v1/report
@@ -67,11 +98,42 @@ func NewReportHandler(snapshotStore *store.RedisSnapshotStore, wsHub *ws.Hub, lo
 //
 // ReportMetrics 接收 Agent 上报的批量指标数据
 // @Summary      上报设备指标
-// @Description  接收经过 Gzip 压缩的 Batch 指标包，包含进程、服务和网络连接
+// @Description  接收经过 Gzip 压缩的上报包（支持 direct 与 batch 两种格式）。其中也包含 USB 安全审计事件（usb_events / usb_event / batch items dataType=usb_event|usb|usb_audit）。
+//
+// 示例（USB 事件 - 旧版 direct）:
+// {
+//   "device_id": "HOST_FINGERPRINT_ABC",
+//   "usb_events": [
+//     {
+//       "device_id": "HOST_FINGERPRINT_ABC",
+//       "action": "insert",
+//       "usb_id": "USB\\\\VID_0781&PID_5580&REV_0001",
+//       "volume_name": "E:",
+//       "timestamp": 1710000000
+//     }
+//   ],
+//   "reported_at": 1710000000
+// }
+//
+// 示例（USB 事件 - batch items）:
+// {
+//   "items": [
+//     {
+//       "dataType": "usb_event",
+//       "payload": {
+//         "device_id": "HOST_FINGERPRINT_ABC",
+//         "usb_id": "USB\\\\VID_0781&PID_5580&REV_0001",
+//         "volume_name": "E:",
+//         "action": "insert",
+//         "timestamp": 1710000000
+//       }
+//     }
+//   ]
+// }
 // @Accept       json
 // @Produce      json
 // @Param        Content-Encoding  header  string  true  "必须为 gzip"
-// @Param        payload           body    ApiBatchRequest  true  "指标数据包（批量 items 列表，含 host_metrics/security_snapshot）"
+// @Param        payload           body    ApiReportSwaggerRequest  true  "指标数据包（兼容 direct 与 batch；含 USB 事件 usb_events/usb_event 或 batch items）"
 // @Success      200  {object}  map[string]string "{"status":"ok"}"
 // @Failure      400  {object}  map[string]string "{"error":"invalid JSON"}"
 // @Failure      413  {object}  map[string]string "{"error":"payload too large"}"
@@ -288,6 +350,59 @@ func (h *ReportHandler) handleOldDirect(ctx context.Context, req model.ReportReq
 
 	saveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
+
+	// Parse and persist USBEvents in batch.
+	if len(req.USBEvents) > 0 {
+		entries := make([]store.USBLogEntry, 0, len(req.USBEvents))
+		for _, e := range req.USBEvents {
+			hostID := strings.TrimSpace(e.DeviceID)
+			if hostID == "" {
+				hostID = strings.TrimSpace(req.DeviceID)
+			}
+			if hostID == "" {
+				continue
+			}
+			at := time.Unix(e.Timestamp, 0)
+			if e.Timestamp <= 0 {
+				at = time.Now()
+			}
+			action := strings.ToLower(strings.TrimSpace(e.Action))
+			originalAction := action
+			// Treat initial-state "existing" as "insert" so the frontend can reflect current USB usage.
+			if action == "existing" {
+				action = "insert"
+			}
+			entries = append(entries, store.USBLogEntry{
+				HostDeviceID: hostID,
+				USBID:        strings.TrimSpace(e.USBID),
+				VolumeName:   strings.TrimSpace(e.VolumeName),
+				Action:       action,
+				CreatedAt:    at,
+			})
+			h.logger.Info("usb event received", "device_id", hostID, "action", action, "usb_id", strings.TrimSpace(e.USBID))
+			if action == "insert" && h.store.IsUSBDisabled(ctx, hostID) {
+				h.logger.Error(
+					"SECURITY ALERT: USB insert/initial-existing detected while policy is disabled",
+					"device_id", hostID,
+					"usb_id", e.USBID,
+					"volume_name", e.VolumeName,
+					"event_action", originalAction,
+				)
+			}
+		}
+		if h.usbStore != nil && len(entries) > 0 {
+			if err := h.usbStore.BatchInsert(saveCtx, entries); err != nil {
+				h.logger.Warn("batch insert usb_logs failed", "err", err, "device_id", req.DeviceID, "count", len(entries))
+			} else {
+				h.logger.Info("usb logs persisted", "source", "direct", "count", len(entries))
+				// Realtime notify DeviceDetail to refresh USB audit.
+				if h.usbMgr != nil {
+					h.usbMgr.BroadcastUSBUpdate(req.DeviceID)
+				}
+			}
+		}
+	}
+
 	if err := h.store.SaveSnapshot(saveCtx, snap); err != nil {
 		h.logger.Error("save snapshot to redis failed", "err", err, "device_id", req.DeviceID)
 		return err
@@ -318,6 +433,7 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 	now := time.Now().Unix()
 
 	partials := make(map[string]*devicePartialUpdate)
+	usbEntries := make([]store.USBLogEntry, 0, 16)
 	getPartial := func(deviceID string) *devicePartialUpdate {
 		p := partials[deviceID]
 		if p == nil {
@@ -334,6 +450,86 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 			continue
 		}
 		switch dt {
+		case "usb_event", "usb", "usb_audit":
+			// Try to determine host device id
+			fp := extractFingerprintFromPayload(it.Payload)
+			if fp == "" {
+				// Fallback keys commonly used for host id
+				var obj map[string]json.RawMessage
+				if json.Unmarshal(it.Payload, &obj) == nil {
+					for _, k := range []string{"host_fingerprint", "hostDeviceID", "host_device_id", "host", "device_id"} {
+						if v, ok := obj[k]; ok {
+							var s string
+							if json.Unmarshal(v, &s) == nil && strings.TrimSpace(s) != "" {
+								fp = strings.TrimSpace(s)
+								break
+							}
+						}
+					}
+				}
+			}
+			if fp == "" {
+				// If batch has a unique device id, use it
+				fp = batchDeviceID
+			}
+			if fp == "" {
+				h.logger.Warn("usb_event missing device fingerprint; skipping audit save")
+				continue
+			}
+			// Parse fields
+			var obj map[string]any
+			if err := json.Unmarshal(it.Payload, &obj); err != nil {
+				h.logger.Warn("usb_event payload parse failed", "device_id", fp, "err", err)
+				continue
+			}
+			usbID := strings.TrimSpace(getStringAny(obj["usb_id"]))
+			if usbID == "" {
+				// Backward-compatible: some agents may send DeviceID for USB device id
+				usbID = strings.TrimSpace(getStringAny(firstNonNil(obj["device_id"], obj["DeviceID"])))
+			}
+			volumeName := strings.TrimSpace(getStringAny(firstNonNil(obj["volume_name"], obj["VolumeName"])))
+			action := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(obj["action"], obj["Action"]))))
+			originalAction := action
+			// Treat initial-state "existing" as "insert" so the frontend can reflect current USB usage.
+			if action == "existing" {
+				action = "insert"
+			}
+			ts := time.Now().Unix()
+			tmpTs := firstNonNil(obj["timestamp"], obj["Timestamp"])
+			srcTs := firstNonNil(obj["ts"], tmpTs)
+			if v := strings.TrimSpace(getStringAny(srcTs)); v != "" {
+				// Accept RFC3339 or unix seconds
+				if t, err := time.Parse(time.RFC3339, v); err == nil {
+					ts = t.Unix()
+				} else if n, err2 := strconv.ParseInt(v, 10, 64); err2 == nil && n > 0 {
+					ts = n
+				}
+			}
+			if h.usbMgr != nil {
+				h.usbMgr.SaveAudit(ctx, fp, usbID, volumeName, ts, action)
+			} else if err := h.store.SaveUSBAuditLog(ctx, fp, usbID, volumeName, ts, action); err != nil {
+				h.logger.Warn("save usb audit failed", "device_id", fp, "err", err)
+			}
+			usbEntries = append(usbEntries, store.USBLogEntry{
+				HostDeviceID: fp,
+				USBID:        usbID,
+				VolumeName:   volumeName,
+				Action:       action,
+				CreatedAt:    time.Unix(ts, 0),
+			})
+			h.logger.Info("usb event received", "device_id", fp, "action", action, "usb_id", usbID)
+			// Real-time alert: insert detected while USB disabled
+			if action == "insert" && h.store.IsUSBDisabled(ctx, fp) {
+				h.logger.Error(
+					"SECURITY ALERT: USB insert/initial-existing detected while policy is disabled",
+					"device_id", fp,
+					"usb_id", usbID,
+					"volume_name", volumeName,
+					"event_action", originalAction,
+				)
+				go h.sendUSBDisabledAlert(fp, usbID, volumeName, ts)
+			}
+
 		case "host_metrics":
 			fp := extractFingerprintFromPayload(it.Payload)
 			if fp == "" {
@@ -483,13 +679,23 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 		}
 	}
 
+	saveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if h.usbStore != nil && len(usbEntries) > 0 {
+		if err := h.usbStore.BatchInsert(saveCtx, usbEntries); err != nil {
+			h.logger.Warn("batch insert usb_logs failed", "err", err, "count", len(usbEntries))
+		} else {
+			h.logger.Info("usb logs persisted", "source", "batch", "count", len(usbEntries))
+			if h.usbMgr != nil && batchDeviceID != "" {
+				h.usbMgr.BroadcastUSBUpdate(batchDeviceID)
+			}
+		}
+	}
+
 	if len(partials) == 0 {
 		// Batch without process/software updates is still OK.
 		return nil
 	}
-
-	saveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
 
 	// Persist merged full snapshot per device, then broadcast once per device (after full batch handling).
 	for deviceID, p := range partials {
@@ -621,6 +827,52 @@ func (h *ReportHandler) sendCriticalAlert(deviceID string, raw []byte) {
 		return
 	}
 	_ = resp.Body.Close()
+}
+
+func (h *ReportHandler) sendUSBDisabledAlert(deviceID, usbID, volumeName string, ts int64) {
+	webhook := strings.TrimSpace(os.Getenv("ALERT_WEBHOOK_URL"))
+	if webhook == "" {
+		return
+	}
+	body := map[string]any{
+		"text":        "[SecurityAlert] USB 已禁用，但检测到插入尝试",
+		"device_id":   deviceID,
+		"usb_id":      usbID,
+		"volume_name": volumeName,
+		"ts":          ts,
+	}
+	payload, _ := json.Marshal(body)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook, bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.logger.Warn("usb disabled alert send failed", "device_id", deviceID, "err", err)
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+// local helpers (mirroring store helpers) to parse arbitrary JSON objects
+func firstNonNil(a, b any) any {
+	if a != nil {
+		return a
+	}
+	return b
+}
+func getStringAny(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	default:
+		return ""
+	}
 }
 
 func (h *ReportHandler) broadcastSnapshot(deviceID string, snap model.SnapshotPush) {

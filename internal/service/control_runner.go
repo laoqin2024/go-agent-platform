@@ -233,6 +233,35 @@ func (r *ControlRunner) handleCommand(ctx context.Context, msg controlMessage) (
 		}
 		r.updater.TriggerNow()
 		return 0, "正在更新..."
+	case "set_usb_storage_enabled":
+		// Args: ["true"|"false"] or ["enable"|"disable"]
+		enabled := false
+		if len(msg.Args) > 0 {
+			v := strings.ToLower(strings.TrimSpace(msg.Args[0]))
+			if v == "true" || v == "1" || v == "enable" || v == "enabled" || v == "on" {
+				enabled = true
+			}
+		}
+		if err := SetUSBStorageEnabled(enabled); err != nil {
+			return 1, fmt.Sprintf("set usb storage failed: %v", err)
+		}
+		return 0, fmt.Sprintf("usb storage set to %v", enabled)
+	case "usb_allow_instance":
+		if len(msg.Args) == 0 || strings.TrimSpace(msg.Args[0]) == "" {
+			return 1, "missing usb instance id"
+		}
+		id := strings.TrimSpace(msg.Args[0])
+		AddAllowedInstanceID(id)
+		return 0, fmt.Sprintf("usb instance added to allowlist: %s", id)
+	case "usb_disconnect_instance":
+		if len(msg.Args) == 0 || strings.TrimSpace(msg.Args[0]) == "" {
+			return 1, "missing usb instance id"
+		}
+		id := strings.TrimSpace(msg.Args[0])
+		if err := DisconnectUSBInstanceID(id); err != nil {
+			return 1, fmt.Sprintf("disconnect usb instance failed: %v", err)
+		}
+		return 0, fmt.Sprintf("usb instance disconnected: %s", id)
 	default:
 		return 1, "unsupported command"
 	}

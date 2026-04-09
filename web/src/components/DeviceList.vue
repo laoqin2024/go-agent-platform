@@ -27,7 +27,7 @@ type Props = {
 
 const props = defineProps<Props>();
 const emit = defineEmits<{
-  (e: "select", deviceId: string): void;
+  (_e: "select", _deviceId: string): void;
 }>();
 
 const q = ref("");
@@ -75,7 +75,9 @@ watch(
           if (id) ids.add(id);
         }
         softMatchedDeviceIds.value = ids;
-      } catch {
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(err);
         softMatchedDeviceIds.value = new Set<string>();
       } finally {
         softSearchLoading.value = false;

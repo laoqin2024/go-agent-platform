@@ -2,12 +2,23 @@ package model
 
 import "encoding/json"
 
+// USBEvent is one USB audit event reported by agent.
+type USBEvent struct {
+	DeviceID   string `json:"device_id"`
+	Action     string `json:"action"`      // insert/remove
+	USBID      string `json:"usb_id"`      // hardware device id
+	VolumeName string `json:"volume_name"` // volume label or drive letter
+	Timestamp  int64  `json:"timestamp"`   // unix seconds
+}
+
 // ReportRequest is the required payload format for POST /api/v1/report.
 // processes and software_list are stored as raw JSON arrays/objects.
 type ReportRequest struct {
 	DeviceID      string          `json:"device_id"`
 	Processes     json.RawMessage `json:"processes"`
 	SoftwareList  json.RawMessage `json:"software_list"`
+	USBEvents     []USBEvent      `json:"usb_events,omitempty"`
+	USBEvent      json.RawMessage `json:"usb_event,omitempty"`
 	ReportedAtSec int64           `json:"reported_at,omitempty"`
 }
 

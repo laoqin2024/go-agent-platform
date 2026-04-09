@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log/slog"
 	"os"
@@ -9,11 +10,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/qinyilin/go-agent/internal/buffer"
 	"github.com/qinyilin/go-agent/internal/collector"
+	"github.com/qinyilin/go-agent/internal/models"
 	internalservice "github.com/qinyilin/go-agent/internal/service"
 	"github.com/qinyilin/go-agent/internal/transport"
 
@@ -51,6 +54,12 @@ func main() {
 		allowedServices    = flag.String("control-allowed-services", "go-agent", "allowed restart service names")
 	)
 	flag.Parse()
+
+	// `-debug` is intended to enable debug logging during troubleshooting.
+	// If user didn't explicitly set `--log-level`, switch it to `debug`.
+	if *debug && strings.EqualFold(strings.TrimSpace(*logLevel), "info") {
+		*logLevel = "debug"
+	}
 
 	logger := internalservice.NewLogger(*logLevel)
 
@@ -118,9 +127,21 @@ func main() {
 	}
 	controlDeviceID := *deviceID
 	if controlDeviceID == "" {
-		hw, err := collector.NewHardwareCollector().CollectWithContext(context.Background())
-		if err == nil && hw.Fingerprint != "" {
-			controlDeviceID = hw.Fingerprint
+		// Retry a few times so transient startup/WMI hiccups do not leave USB events without host ownership.
+		for i := 0; i < 3 && strings.TrimSpace(controlDeviceID) == ""; i++ {
+			hw, err := collector.NewHardwareCollector().CollectWithContext(context.Background())
+			if err == nil && strings.TrimSpace(hw.Fingerprint) != "" {
+				controlDeviceID = strings.TrimSpace(hw.Fingerprint)
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if strings.TrimSpace(controlDeviceID) == "" {
+			// Last-resort fallback to keep audit rows attributable; server can still display records.
+			if hn, err := os.Hostname(); err == nil && strings.TrimSpace(hn) != "" {
+				controlDeviceID = "host-" + strings.TrimSpace(hn)
+				logger.Warn("hardware fingerprint unavailable at startup, fallback to hostname for control/usb device_id", "device_id", controlDeviceID)
+			}
 		}
 	}
 	updateRunner := internalservice.NewUpdateRunner(
@@ -151,6 +172,61 @@ func main() {
 		internalservice.WithControlRunner(controlRunner),
 		internalservice.WithUpdateRunner(updateRunner),
 	)
+
+	// USB monitor: run asynchronously and push events immediately via dispatcher.
+	{
+		// Configure runtime policy fetcher for fine-grained allowlist.
+		internalservice.ConfigureUSBPolicyFetcher(*apiURL, controlDeviceID)
+		// Suppress event bursts: same host device + same action within a short window only processed once.
+		const usbEventSuppressWindow = 5 * time.Second
+		var usbSupMu sync.Mutex
+		lastUSBProcessed := make(map[string]time.Time, 16)
+
+		usbCtx, cancel := context.WithCancel(context.Background())
+		_ = cancel // attached to service lifecycle via wrapper; keep for future wiring if needed
+		_ = internalservice.StartUSBMonitor(usbCtx, logger, 0, func(e models.USBEvent) {
+			// Fill host id for audit ownership.
+			e.DeviceID = strings.TrimSpace(controlDeviceID)
+			if e.DeviceID == "" {
+				// Guardrail: never send unowned USB audit records.
+				if hn, err := os.Hostname(); err == nil && strings.TrimSpace(hn) != "" {
+					e.DeviceID = "host-" + strings.TrimSpace(hn)
+				}
+			}
+			if e.Timestamp <= 0 {
+				e.Timestamp = time.Now().Unix()
+			}
+
+			// Suppress repeated events for the same (host + usb + action) to avoid dispatch storms.
+			actionKey := strings.ToLower(strings.TrimSpace(e.Action))
+			hostID := strings.TrimSpace(e.DeviceID)
+			usbID := strings.ToUpper(strings.TrimSpace(e.USBID))
+			if usbID == "" {
+				usbID = "UNKNOWN"
+			}
+			key := hostID + "|" + usbID + "|" + actionKey
+			now := time.Now()
+			usbSupMu.Lock()
+			if lastAt, ok := lastUSBProcessed[key]; ok && now.Sub(lastAt) < usbEventSuppressWindow {
+				usbSupMu.Unlock()
+				return
+			}
+			lastUSBProcessed[key] = now
+			usbSupMu.Unlock()
+
+			payload, err := json.Marshal(e)
+			if err != nil {
+				logger.Warn("marshal usb event failed", "err", err)
+				return
+			}
+			if err := cache.Save("usb_event", payload); err != nil {
+				logger.Warn("cache usb event failed", "err", err)
+				return
+			}
+			// Attempt immediate dispatch
+			dispatcher.DispatchNow(context.Background())
+		})
+	}
 
 	if runForeground {
 		logger.Info("foreground mode: starting agent service (will stop on Ctrl+C/window close)")

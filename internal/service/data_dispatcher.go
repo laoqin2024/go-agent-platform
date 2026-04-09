@@ -98,6 +98,12 @@ func (d *DataDispatcher) Run(ctx context.Context) {
 	}
 }
 
+// DispatchNow exposes a one-shot dispatch for urgent events.
+// Safe to call from other goroutines.
+func (d *DataDispatcher) DispatchNow(ctx context.Context) {
+	d.dispatchOnce(ctx)
+}
+
 type apiBatchRequestItem struct {
 	DataType string          `json:"dataType"`
 	Payload  json.RawMessage `json:"payload"`

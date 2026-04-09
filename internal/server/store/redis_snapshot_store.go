@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +24,10 @@ type RedisSnapshotStore struct {
 	expireKeyPref string // SET agent:snapshot:exp:{device_id} 1 EXPIRE(ttl)
 	whitelistKey  string // HSET agent:risk_whitelist { device_id:proto:port => json }
 	notifySuppPref string // SETNX agent:notify_suppress:{device_id}:{vuln_key} 1 EX ttl
+	usbAuditStream string // XADD agent:usb_audit_logs MAXLEN ~ 10000 fields...
+	usbPolicyKey    string // HSET agent:usb_policy { device_id => "disabled"|"enabled" }
+	usbAllowKey     string // HSET agent:usb_allowlist { device_id => json_array_of_instance_ids }
+	usbAllowedDevicesKey string // HSET agent:usb_allowed_devices { device_id => json_array_of_devices }
 }
 
 type AssetSearchHit struct {
@@ -56,6 +62,10 @@ func NewRedisSnapshotStore(client *redis.Client, ttl time.Duration) *RedisSnapsh
 		expireKeyPref: "agent:snapshot:exp:",
 		whitelistKey:  "agent:risk_whitelist",
 		notifySuppPref: "agent:notify_suppress:",
+		usbAuditStream: "agent:usb_audit_logs",
+		usbPolicyKey:   "agent:usb_policy",
+		usbAllowKey:    "agent:usb_allowlist",
+		usbAllowedDevicesKey: "agent:usb_allowed_devices",
 	}
 }
 
@@ -176,6 +186,285 @@ func (s *RedisSnapshotStore) SaveSnapshot(ctx context.Context, snap model.Snapsh
 	}
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+type USBAuditLog struct {
+	DeviceID   string
+	USBID      string
+	VolumeName string
+	Timestamp  int64
+	Action     string
+}
+
+// ListUSBAuditLogs returns latest N audit logs for a device by scanning the tail of the Stream.
+func (s *RedisSnapshotStore) ListUSBAuditLogs(ctx context.Context, deviceID string, limit int) ([]USBAuditLog, error) {
+	if deviceID == "" || limit <= 0 {
+		return []USBAuditLog{}, nil
+	}
+	// Read last K entries and filter by device_id; K is a soft cap to bound cost.
+	const scan = 200
+	res, err := s.client.XRevRangeN(ctx, s.usbAuditStream, "+", "-", scan).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	out := make([]USBAuditLog, 0, limit)
+	for _, x := range res {
+		m := x.Values
+		dev := strings.TrimSpace(getStringAny(m["device_id"]))
+		if dev != deviceID {
+			continue
+		}
+		ts := int64(0)
+		if v := strings.TrimSpace(getStringAny(m["timestamp"])); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				ts = n
+			}
+		}
+		item := USBAuditLog{
+			DeviceID:   dev,
+			USBID:      strings.TrimSpace(getStringAny(m["usb_id"])),
+			VolumeName: strings.TrimSpace(getStringAny(m["volume_name"])),
+			Timestamp:  ts,
+			Action:     strings.ToLower(strings.TrimSpace(getStringAny(m["action"]))),
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// SaveUSBAuditLog appends one USB audit record to Redis Stream.
+// Fields: device_id, usb_id, volume_name, timestamp(unix), action
+func (s *RedisSnapshotStore) SaveUSBAuditLog(ctx context.Context, deviceID, usbID, volumeName string, ts int64, action string) error {
+	if deviceID == "" || action == "" {
+		return errors.New("usb audit: empty device_id or action")
+	}
+	values := map[string]any{
+		"device_id":   deviceID,
+		"usb_id":      strings.TrimSpace(usbID),
+		"volume_name": strings.TrimSpace(volumeName),
+		"timestamp":   strconv.FormatInt(ts, 10),
+		"action":      strings.ToLower(strings.TrimSpace(action)),
+	}
+	// XADD with soft cap
+	_, err := s.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.usbAuditStream,
+		MaxLen: 10000,
+		Approx: true,
+		Values: values,
+	}).Result()
+	return err
+}
+
+// IsUSBDisabled returns true if device policy is "disabled".
+// Policy can be set externally into HSET agent:usb_policy { device_id => "disabled" }.
+// If USB_GLOBAL_POLICY=disabled is set, returns true for all devices unless explicitly enabled.
+func (s *RedisSnapshotStore) IsUSBDisabled(ctx context.Context, deviceID string) bool {
+	if deviceID == "" {
+		return false
+	}
+	// Per-device policy
+	if v, err := s.client.HGet(ctx, s.usbPolicyKey, deviceID).Result(); err == nil {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "disabled" || v == "disable" || v == "off" {
+			return true
+		}
+		if v == "enabled" || v == "enable" || v == "on" {
+			return false
+		}
+	}
+	// Global default via env
+	if strings.ToLower(strings.TrimSpace(os.Getenv("USB_GLOBAL_POLICY"))) == "disabled" {
+		return true
+	}
+	return false
+}
+
+// sanitizeInstanceID collapses multiple backslashes into a single "\" and trims spaces,
+// then uppercases for consistent matching with agent-side normalization.
+func sanitizeInstanceID(id string) string {
+	v := strings.TrimSpace(id)
+	if v == "" {
+		return ""
+	}
+	// Replace sequences of backslashes with a single backslash
+	re := regexp.MustCompile(`\\+`)
+	v = re.ReplaceAllString(v, `\`)
+	return strings.ToUpper(v)
+}
+
+// GetUSBAllowlist returns the per-device USB instance allowlist (Instance IDs).
+func (s *RedisSnapshotStore) GetUSBAllowlist(ctx context.Context, deviceID string) ([]string, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, errors.New("empty device_id")
+	}
+	raw, err := s.client.HGet(ctx, s.usbAllowKey, deviceID).Result()
+	if err == redis.Nil {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var items []string
+	if strings.TrimSpace(raw) == "" {
+		return []string{}, nil
+	}
+	if json.Unmarshal([]byte(raw), &items) != nil {
+		// tolerate malformed old values
+		return []string{}, nil
+	}
+	// Normalize
+	uniq := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		k := sanitizeInstanceID(it)
+		if k != "" {
+			uniq[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(uniq))
+	for k := range uniq {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SetUSBAllowlist replaces the per-device allowlist.
+func (s *RedisSnapshotStore) SetUSBAllowlist(ctx context.Context, deviceID string, items []string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return errors.New("empty device_id")
+	}
+	// Normalize + uniq
+	uniq := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		k := sanitizeInstanceID(it)
+		if k != "" {
+			uniq[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(uniq))
+	for k := range uniq {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	b, _ := json.Marshal(out)
+	return s.client.HSet(ctx, s.usbAllowKey, deviceID, string(b)).Err()
+}
+
+// AddUSBAllowInstance adds one instance id to allowlist.
+func (s *RedisSnapshotStore) AddUSBAllowInstance(ctx context.Context, deviceID, instanceID string) error {
+	instanceID = sanitizeInstanceID(instanceID)
+	cur, err := s.GetUSBAllowlist(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	cur = append(cur, instanceID)
+	return s.SetUSBAllowlist(ctx, deviceID, cur)
+}
+
+// RemoveUSBAllowInstance removes one instance id from allowlist.
+func (s *RedisSnapshotStore) RemoveUSBAllowInstance(ctx context.Context, deviceID, instanceID string) error {
+	cur, err := s.GetUSBAllowlist(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	key := sanitizeInstanceID(instanceID)
+	next := make([]string, 0, len(cur))
+	for _, it := range cur {
+		if sanitizeInstanceID(it) == key {
+			continue
+		}
+		next = append(next, it)
+	}
+	return s.SetUSBAllowlist(ctx, deviceID, next)
+}
+
+// GetUSBAllowedDevices returns per-device logical "AllowedDevices" list.
+func (s *RedisSnapshotStore) GetUSBAllowedDevices(ctx context.Context, deviceID string) ([]string, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, errors.New("empty device_id")
+	}
+	raw, err := s.client.HGet(ctx, s.usbAllowedDevicesKey, deviceID).Result()
+	if err == redis.Nil {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return []string{}, nil
+	}
+	var items []string
+	if json.Unmarshal([]byte(raw), &items) != nil {
+		return []string{}, nil
+	}
+	uniq := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		k := strings.TrimSpace(it)
+		if k != "" {
+			uniq[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(uniq))
+	for k := range uniq {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SetUSBAllowedDevices replaces the list.
+func (s *RedisSnapshotStore) SetUSBAllowedDevices(ctx context.Context, deviceID string, items []string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return errors.New("empty device_id")
+	}
+	uniq := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		k := strings.TrimSpace(it)
+		if k != "" {
+			uniq[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(uniq))
+	for k := range uniq {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	b, _ := json.Marshal(out)
+	return s.client.HSet(ctx, s.usbAllowedDevicesKey, deviceID, string(b)).Err()
+}
+
+// AddUSBAllowedDevice appends one entry.
+func (s *RedisSnapshotStore) AddUSBAllowedDevice(ctx context.Context, deviceID, allowed string) error {
+	cur, err := s.GetUSBAllowedDevices(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	cur = append(cur, allowed)
+	return s.SetUSBAllowedDevices(ctx, deviceID, cur)
+}
+
+// RemoveUSBAllowedDevice removes one entry.
+func (s *RedisSnapshotStore) RemoveUSBAllowedDevice(ctx context.Context, deviceID, allowed string) error {
+	cur, err := s.GetUSBAllowedDevices(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	key := strings.TrimSpace(allowed)
+	next := make([]string, 0, len(cur))
+	for _, it := range cur {
+		if strings.TrimSpace(it) == key {
+			continue
+		}
+		next = append(next, it)
+	}
+	return s.SetUSBAllowedDevices(ctx, deviceID, next)
 }
 
 type storedMeta struct {

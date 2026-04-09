@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type { WSConnectionStatus } from "../composables/useWebSocket";
 import { formatSpeed } from "../utils/format";
+import { request } from "../utils/request";
 
 type Device = {
   deviceId: string;
@@ -28,7 +29,7 @@ type Props = {
 const props = defineProps<Props>();
 
 const emit = defineEmits<{
-  (e: "retry-ws"): void;
+  (_e: "retry-ws"): void;
 }>();
 
 const manualRetrying = ref(false);
@@ -99,7 +100,299 @@ watch(
 const procQuery = ref("");
 const swQuery = ref("");
 const swRiskOnly = ref(false);
-const activeTab = ref<"overview" | "network" | "hardware" | "compute" | "security" | "software">("overview");
+const activeTab = ref<"overview" | "network" | "hardware" | "compute" | "security" | "software" | "usb">("overview");
+
+// ---------------- USB 管控（Mock Contract） ----------------
+type USBPolicyMock = {
+  disabled: boolean;
+  allowlist: string[];
+};
+
+type USBLogEntry = {
+  usb_id: string;
+  action: "insert" | "remove";
+  created_at: string; // ISO string
+  volume_name?: string;
+};
+
+type ParsedUSBID = {
+  vendor: string;
+  product: string;
+  vid: string;
+  pid: string;
+  short: string;
+  displayTitle: string;
+};
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+function titleizeToken(raw: string): string {
+  const s = String(raw || "").trim().replace(/[_\s]+/g, " ");
+  if (!s) return "";
+  return s
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+// parseUsbId must extract vendor from e.g. USBSTOR\DISK&VEN_VERBATIM&PROD_...
+function parseUsbId(id: string): ParsedUSBID {
+  const raw = String(id || "").trim();
+  const upper = raw.toUpperCase();
+
+  const pickToken = (key: string) => {
+    const idx = upper.indexOf(key);
+    if (idx < 0) return "";
+    const start = idx + key.length;
+    const end = upper.indexOf("&", start);
+    const token = raw.slice(start, end >= 0 ? end : raw.length);
+    return token.trim();
+  };
+
+  const ven = pickToken("VEN_");
+  const prod = pickToken("PROD_");
+  const vid = pickToken("VID_");
+  const pid = pickToken("PID_");
+
+  const vendor = titleizeToken(ven || "Unknown");
+  const product = titleizeToken(prod || "");
+
+  const shortParts = [
+    vendor && vendor !== "Unknown" ? vendor : "",
+    product ? product : "",
+    vid && pid ? `${vid.toUpperCase()}:${pid.toUpperCase()}` : "",
+  ].filter(Boolean);
+
+  const displayTitle = shortParts.length ? shortParts.slice(0, 2).join(" · ") : "Unknown USB";
+  const short = shortParts.length ? shortParts.join(" · ") : shorten(raw, 36);
+  return {
+    vendor,
+    product,
+    vid: vid.toUpperCase(),
+    pid: pid.toUpperCase(),
+    short,
+    displayTitle,
+  };
+}
+
+function normalizeUSBID(id: string): string {
+  return String(id || "").trim().toUpperCase().replace(/\\+/g, "\\");
+}
+
+const usbPolicy = ref<USBPolicyMock>({ disabled: false, allowlist: [] });
+const usbPolicyLoading = ref(false);
+const usbPolicyError = ref<string | null>(null);
+
+const usbLogs = ref<USBLogEntry[]>([]);
+const usbLogsLoading = ref(false);
+const usbLogsError = ref<string | null>(null);
+
+const usbMockSeededForDevice = ref<string>("");
+
+const allowlistSet = computed(() => new Set((usbPolicy.value?.allowlist ?? []).map((x) => normalizeUSBID(x))));
+
+const usbStatusText = computed(() => {
+  if (usbPolicyLoading.value) return "正在同步策略...";
+  if (usbPolicyError.value) return "策略同步异常";
+  return usbPolicy.value.disabled ? "已禁用" : "已启用";
+});
+
+const usbPolicySwitchChecked = computed(() => !usbPolicy.value.disabled);
+
+async function fetchUSBPolicy(deviceId: string) {
+  if (!deviceId) return;
+  usbPolicyLoading.value = true;
+  usbPolicyError.value = null;
+  try {
+    // eslint-disable-next-line no-console
+    console.log("[MOCK] fetchUSBPolicy", { deviceId });
+    await sleep(180);
+    const resp: USBPolicyMock = {
+      disabled: !!usbPolicy.value?.disabled,
+      allowlist: Array.isArray(usbPolicy.value?.allowlist) ? [...usbPolicy.value.allowlist] : [],
+    };
+    usbPolicy.value = resp;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    usbPolicyError.value = "failed";
+  } finally {
+    usbPolicyLoading.value = false;
+  }
+}
+
+async function toggleUSBPolicy(deviceId: string, nextDisabled: boolean) {
+  if (!deviceId) return;
+  usbPolicyLoading.value = true;
+  usbPolicyError.value = null;
+  try {
+    // eslint-disable-next-line no-console
+    console.log("[MOCK] toggleUSBPolicy POST", { deviceId, disabled: nextDisabled });
+    await sleep(220);
+    usbPolicy.value = { ...usbPolicy.value, disabled: nextDisabled };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    usbPolicyError.value = "failed";
+  } finally {
+    usbPolicyLoading.value = false;
+  }
+}
+
+async function fetchUSBLogs(deviceId: string) {
+  if (!deviceId) return;
+  usbLogsLoading.value = true;
+  usbLogsError.value = null;
+  try {
+    // eslint-disable-next-line no-console
+    console.log("[MOCK] fetchUSBLogs", { deviceId });
+    await sleep(220);
+
+    // One-time seed so the UI isn't empty during integration (remove when wiring real API).
+    if (!usbMockSeededForDevice.value || usbMockSeededForDevice.value !== deviceId) {
+      usbMockSeededForDevice.value = deviceId;
+      const now = Date.now();
+      const iso = (t: number) => new Date(t).toISOString();
+      usbLogs.value = [
+        {
+          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
+          action: "insert",
+          created_at: iso(now - 2 * 60 * 1000),
+          volume_name: "E: [VERBATIM]",
+        },
+        {
+          usb_id: `USBSTOR\\DISK&VEN_SAN_DISK&PROD_ULTRA&REV_1.00\\ABCDEF012345&0`,
+          action: "insert",
+          created_at: iso(now - 8 * 60 * 1000),
+          volume_name: "F: [SANDISK]",
+        },
+        {
+          usb_id: `USBSTOR\\DISK&VEN_SAN_DISK&PROD_ULTRA&REV_1.00\\ABCDEF012345&0`,
+          action: "remove",
+          created_at: iso(now - 12 * 60 * 1000),
+          volume_name: "F: [SANDISK]",
+        },
+        {
+          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
+          action: "remove",
+          created_at: iso(now - 30 * 60 * 1000),
+          volume_name: "E: [VERBATIM]",
+        },
+        {
+          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
+          action: "insert",
+          created_at: iso(now - 55 * 60 * 1000),
+          volume_name: "E: [VERBATIM]",
+        },
+      ];
+      // eslint-disable-next-line no-console
+      console.log("[MOCK] seeded usb_logs", { deviceId, count: usbLogs.value.length });
+    }
+
+    const items: USBLogEntry[] = Array.isArray(usbLogs.value) ? usbLogs.value : [];
+    usbLogs.value = items;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    usbLogsError.value = "failed";
+    usbLogs.value = [];
+  } finally {
+    usbLogsLoading.value = false;
+  }
+}
+
+async function toggleAllowlist(deviceId: string, usbId: string, nextInAllowlist: boolean) {
+  if (!deviceId) return;
+  const norm = normalizeUSBID(usbId);
+  usbPolicyLoading.value = true;
+  usbPolicyError.value = null;
+  try {
+    // eslint-disable-next-line no-console
+    console.log("[MOCK] toggleAllowlist", {
+      method: nextInAllowlist ? "POST" : "DELETE",
+      deviceId,
+      usb_id: usbId,
+    });
+    await sleep(200);
+    const cur = Array.isArray(usbPolicy.value.allowlist) ? usbPolicy.value.allowlist : [];
+    const curSet = new Set(cur.map((x) => normalizeUSBID(x)));
+    if (nextInAllowlist) curSet.add(norm);
+    else curSet.delete(norm);
+    usbPolicy.value = { ...usbPolicy.value, allowlist: Array.from(curSet) };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    usbPolicyError.value = "failed";
+  } finally {
+    usbPolicyLoading.value = false;
+  }
+}
+
+async function refreshUSBAll(deviceId: string) {
+  if (!deviceId) return;
+  await Promise.all([fetchUSBPolicy(deviceId), fetchUSBLogs(deviceId)]);
+}
+
+type USBOnlineDevice = {
+  usb_id: string;
+  vendorTitle: string;
+  shortTitle: string;
+  volume_name: string;
+  last_insert_at: string;
+  in_allowlist: boolean;
+};
+
+const usbOnlineDevices = computed<USBOnlineDevice[]>(() => {
+  const logs = Array.isArray(usbLogs.value) ? usbLogs.value : [];
+  if (!logs.length) return [];
+
+  // For each usb_id, find the latest event (by created_at lexicographic ISO, fallback by array order).
+  const lastByID = new Map<string, USBLogEntry>();
+  for (const e of logs) {
+    const id = normalizeUSBID(e?.usb_id || "");
+    if (!id) continue;
+    const prev = lastByID.get(id);
+    if (!prev) {
+      lastByID.set(id, e);
+      continue;
+    }
+    const a = String(prev.created_at || "");
+    const b = String(e.created_at || "");
+    if (b && a) {
+      if (b > a) lastByID.set(id, e);
+    } else {
+      lastByID.set(id, e);
+    }
+  }
+
+  const out: USBOnlineDevice[] = [];
+  for (const [normID, last] of lastByID.entries()) {
+    const action = String(last?.action || "").toLowerCase();
+    if (action !== "insert") continue; // online inference: last action insert
+    const parsed = parseUsbId(normID);
+    const inAllow = allowlistSet.value.has(normID);
+    out.push({
+      usb_id: normID,
+      vendorTitle: parsed.vendor || "Unknown",
+      shortTitle: parsed.displayTitle || parsed.short,
+      volume_name: String(last?.volume_name || "").trim(),
+      last_insert_at: String(last?.created_at || "").trim(),
+      in_allowlist: inAllow,
+    });
+  }
+
+  // Stable sort: allowlisted first, then by last_insert_at desc.
+  out.sort((a, b) => {
+    if (a.in_allowlist !== b.in_allowlist) return a.in_allowlist ? -1 : 1;
+    return String(b.last_insert_at || "").localeCompare(String(a.last_insert_at || ""));
+  });
+  return out;
+});
+
+const usbOnlineCount = computed(() => usbOnlineDevices.value.length);
 
 const VULNERABILITY_RULES: Array<{ name: string; version_lt?: string; version_eq?: string }> = [
   { name: "OpenSSL", version_lt: "3.0.7" },
@@ -419,6 +712,20 @@ watch(
     softwarePanelLoading.value = true;
     swQuery.value = "";
     swRiskOnly.value = false;
+
+    // Reset USB caches when switching device to avoid cross-device confusion.
+    usbPolicy.value = { disabled: false, allowlist: [] };
+    usbPolicyLoading.value = false;
+    usbPolicyError.value = null;
+    usbLogs.value = [];
+    usbLogsLoading.value = false;
+    usbLogsError.value = null;
+    usbMockSeededForDevice.value = "";
+
+    const nextId = selectedDeviceId.value;
+    if (nextId) {
+      void refreshUSBAll(nextId);
+    }
   }
 );
 
@@ -822,12 +1129,18 @@ function loadIgnoredServices() {
     if (!raw) return;
     const arr = JSON.parse(raw);
     if (Array.isArray(arr)) ignoredServiceSet.value = new Set(arr.map((x) => String(x)));
-  } catch {}
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+  }
 }
 function saveIgnoredServices() {
   try {
     localStorage.setItem(IGNORE_KEY, JSON.stringify(Array.from(ignoredServiceSet.value)));
-  } catch {}
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+  }
 }
 onMounted(() => {
   loadIgnoredServices();
@@ -1041,13 +1354,13 @@ function isSoftwareVulnerable(s: any): boolean {
   });
 }
 
-const isWindowsDevice = computed(() => {
+const _isWindowsDevice = computed(() => {
   const osA = String(hw.value?.os ?? "").toLowerCase();
   const osB = String(hw.value?.OS ?? "").toLowerCase();
   return osA.includes("windows") || osB.includes("windows");
 });
 
-function isWindowsPatch(s: any) {
+function _isWindowsPatch(s: any) {
   const name = String(swName(s) || "").toLowerCase();
   const version = String(swVersion(s) || "").toLowerCase();
   const publisher = String(swPublisher(s) || "").toLowerCase();
@@ -1057,16 +1370,6 @@ function isWindowsPatch(s: any) {
   if (name.includes("更新") && publisher.includes("microsoft")) return true;
   return false;
 }
-
-const filteredWindowsPatches = computed(() => {
-  if (!isWindowsDevice.value) return [];
-  return filteredSoftware.value.filter((s: any) => isWindowsPatch(s));
-});
-
-const filteredNormalSoftware = computed(() => {
-  if (!isWindowsDevice.value) return filteredSoftware.value;
-  return filteredSoftware.value.filter((s: any) => !isWindowsPatch(s));
-});
 
 function swName(s: any) {
   return s?.Name ?? s?.name ?? "";
@@ -1078,7 +1381,7 @@ function swPublisher(s: any) {
   return s?.Publisher ?? s?.publisher ?? "";
 }
 
-function parseInstallDateRaw(s: any): string {
+function _parseInstallDateRaw(s: any): string {
   // Try common fields across platforms/payloads
   const raw =
     s?.InstallDate ??
@@ -1113,7 +1416,7 @@ function parseInstallDateRaw(s: any): string {
   return str;
 }
 
-function formatDateLocal(s: string): string {
+function _formatDateLocal(s: string): string {
   if (!s) return "";
   const d = new Date(s);
   if (!isNaN(d.getTime())) {
@@ -1125,10 +1428,6 @@ function formatDateLocal(s: string): string {
     )}`;
   }
   return s;
-}
-
-function swInstallDateText(s: any) {
-  return formatDateLocal(parseInstallDateRaw(s));
 }
 
 function memorySpeedText(v: any) {
@@ -1158,9 +1457,28 @@ const nowMs = ref(Date.now());
 const heartbeatTimer = window.setInterval(() => {
   nowMs.value = Date.now();
 }, 1000);
+
+function handleUSBUpdateEvent(ev: Event) {
+  try {
+    const detail = (ev as CustomEvent<any>)?.detail ?? {};
+    const id = String(detail?.device_id || detail?.deviceId || "").trim();
+    if (!id) return;
+    if (id !== selectedDeviceId.value) return;
+    void refreshUSBAll(id);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+  }
+}
+
+onMounted(() => {
+  window.addEventListener("usb_update", handleUSBUpdateEvent as EventListener);
+});
+
 onUnmounted(() => {
   window.clearInterval(heartbeatTimer);
   window.removeEventListener("click", closeSecurityContextMenu, true);
+  window.removeEventListener("usb_update", handleUSBUpdateEvent as EventListener);
 });
 
 const lastHeartbeatAgoText = computed(() => {
@@ -1486,7 +1804,7 @@ const diskIoHist = ref<Record<string, DiskIOSample[]>>({});
 const selectedDisk = ref<string>("");
 const diskHoverIdx = ref<number | null>(null);
 
-const diskIoList = computed(() => {
+const _diskIoList = computed(() => {
   const arr = asArray(host.value?.disk_io ?? host.value?.DiskIO);
   return arr as any[];
 });
@@ -1749,6 +2067,11 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
           :class="activeTab==='compute' ? 'tab-btn-active' : ''"
           @click="activeTab='compute'"
         >算力与进程</button>
+        <button
+          class="tab-btn transition-colors"
+          :class="activeTab==='usb' ? 'tab-btn-active' : ''"
+          @click="activeTab='usb'"
+        >USB 管控</button>
         <button
           class="tab-btn transition-colors"
           :class="activeTab==='security' ? 'tab-btn-active' : ''"
@@ -2182,6 +2505,221 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
 
       </div>
 
+      <!-- USB 管控（40% / 60% + Glassmorphism） -->
+      <div v-if="activeTab==='usb'" class="min-h-[640px]">
+        <div class="flex flex-col xl:flex-row gap-4">
+          <!-- Left 40%: Online USB devices -->
+          <div class="xl:basis-[40%] xl:max-w-[40%] min-w-0 space-y-4">
+            <!-- Policy switch -->
+            <div class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-4">
+              <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0">
+                  <div class="text-sm font-semibold text-slate-100">USB 策略</div>
+                  <div class="text-[11px] text-slate-400 mt-1">
+                    Mock Contract：点击开关触发 `toggleUSBPolicy()`，收到 `usb_update` 时会全量刷新（策略 + 日志）。
+                  </div>
+                </div>
+                <button
+                  class="relative inline-flex h-7 w-12 items-center rounded-full transition-colors border border-white/10"
+                  :class="usbPolicySwitchChecked ? 'bg-emerald-500/25' : 'bg-red-500/20'"
+                  role="switch"
+                  :aria-checked="usbPolicySwitchChecked"
+                  :disabled="usbPolicyLoading"
+                  @click="toggleUSBPolicy(selectedDeviceId, !usbPolicy.disabled)"
+                  :title="usbPolicyLoading ? '正在提交...' : (usbPolicySwitchChecked ? '点击禁用 USB' : '点击启用 USB')"
+                >
+                  <span
+                    class="inline-block h-5 w-5 transform rounded-full bg-white/80 shadow transition-transform"
+                    :class="usbPolicySwitchChecked ? 'translate-x-6' : 'translate-x-1'"
+                  ></span>
+                </button>
+              </div>
+
+              <div class="mt-3 flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="w-2 h-2 rounded-full" :class="usbPolicySwitchChecked ? 'bg-emerald-400' : 'bg-red-400'"></span>
+                  <div class="text-xs text-slate-200">状态：{{ usbStatusText }}</div>
+                </div>
+                <div class="text-[11px] text-slate-500">
+                  <span v-if="usbPolicyLoading">同步中...</span>
+                  <span v-else-if="usbPolicyError" class="text-red-300">同步失败</span>
+                  <span v-else>Allowlist {{ usbPolicy.allowlist.length }} 项</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Online devices header -->
+            <div class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-4">
+              <div class="flex items-center justify-between">
+                <div class="text-sm font-semibold text-slate-100">当前在线设备</div>
+                <div class="text-[11px] text-slate-400">在线 {{ usbOnlineCount }} 个</div>
+              </div>
+              <div class="mt-2 text-[11px] text-slate-500">
+                在线推断：对每个 `usb_id` 取最后一次 action，若为 insert 则视为在线。
+              </div>
+            </div>
+
+            <!-- Online device cards -->
+            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-1 gap-3">
+              <div
+                v-for="d in usbOnlineDevices"
+                :key="d.usb_id"
+                class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-4"
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <div class="text-base font-semibold text-slate-100 truncate">
+                      {{ d.vendorTitle }}
+                    </div>
+                    <div class="text-[11px] text-slate-400 mt-1 truncate" :title="d.shortTitle">
+                      {{ d.shortTitle }}
+                    </div>
+                  </div>
+                  <span
+                    class="text-[11px] px-2 py-0.5 rounded border font-mono"
+                    :class="d.in_allowlist ? 'border-emerald-700 bg-emerald-500/10 text-emerald-200' : 'border-amber-700 bg-amber-500/10 text-amber-200'"
+                  >
+                    {{ d.in_allowlist ? "已白名单" : "未白名单" }}
+                  </span>
+                </div>
+
+                <div class="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                  <div class="text-slate-400">
+                    <div class="text-slate-500">卷标/盘符</div>
+                    <div class="text-slate-200 truncate" :title="d.volume_name || '-'">{{ d.volume_name || "-" }}</div>
+                  </div>
+                  <div class="text-slate-400">
+                    <div class="text-slate-500">最后插入</div>
+                    <div class="text-slate-200 font-mono truncate" :title="d.last_insert_at || '-'">{{ d.last_insert_at || "-" }}</div>
+                  </div>
+                </div>
+
+                <div class="mt-3 flex items-center justify-between gap-2">
+                  <div class="text-[11px] text-slate-500 truncate" :title="d.usb_id">
+                    ID: {{ shorten(d.usb_id, 28) }}
+                  </div>
+                  <button
+                    class="text-[11px] px-2 py-1 rounded border border-white/10 bg-slate-950/20 hover:bg-slate-950/40 text-slate-200 disabled:opacity-60"
+                    :disabled="usbPolicyLoading"
+                    @click="toggleAllowlist(selectedDeviceId, d.usb_id, !d.in_allowlist)"
+                  >
+                    {{ d.in_allowlist ? "移出白名单" : "加入白名单" }}
+                  </button>
+                </div>
+              </div>
+
+              <div
+                v-if="!usbLogsLoading && usbOnlineDevices.length === 0"
+                class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-6 text-center text-sm text-slate-400"
+              >
+                暂无在线 USB 设备（等待插入事件或日志同步）
+                <div class="mt-2 text-[11px] text-slate-500">
+                  你可以先点一次右侧“刷新”，或等待 `usb_update` 推送触发刷新。
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right 60%: Audit logs table -->
+          <div class="xl:basis-[60%] xl:max-w-[60%] min-w-0">
+            <div class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-4 h-full">
+              <div class="flex items-start justify-between gap-3 mb-3">
+                <div class="min-w-0">
+                  <div class="text-sm font-semibold text-slate-100">审计日志</div>
+                  <div class="text-[11px] text-slate-500 mt-1">
+                    操作列基于 `policy.allowlist` 判断，按钮对接 `toggleAllowlist()`（Mock）。
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <button
+                    class="text-[11px] px-3 py-1.5 rounded border border-white/10 bg-slate-950/20 hover:bg-slate-950/40 text-slate-200 disabled:opacity-60"
+                    :disabled="usbLogsLoading || usbPolicyLoading"
+                    @click="refreshUSBAll(selectedDeviceId)"
+                    title="全量刷新策略 + 日志"
+                  >
+                    {{ usbLogsLoading || usbPolicyLoading ? "刷新中..." : "刷新" }}
+                  </button>
+                  <div class="text-[11px] text-slate-400">
+                    <span v-if="usbLogsLoading">加载中</span>
+                    <span v-else-if="usbLogsError" class="text-red-300">加载失败</span>
+                    <span v-else>{{ usbLogs.length }} 条</span>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="usbLogsLoading" class="h-64 flex items-center justify-center text-sm text-slate-400">
+                正在加载 USB 日志...
+              </div>
+              <div v-else-if="usbLogs.length === 0" class="h-64 flex items-center justify-center text-sm text-slate-400">
+                暂无 USB 审计记录
+              </div>
+              <div v-else class="panel-table-60 scroll-area scroll-dark">
+                <table class="min-w-full text-xs">
+                  <thead class="bg-slate-900/40 text-slate-300 sticky top-0 z-10 backdrop-blur">
+                    <tr>
+                      <th class="px-3 py-2 text-left w-[170px]">时间</th>
+                      <th class="px-3 py-2 text-left w-[120px]">动作</th>
+                      <th class="px-3 py-2 text-left">设备</th>
+                      <th class="px-3 py-2 text-left w-[180px]">卷标/盘符</th>
+                      <th class="px-3 py-2 text-left w-[140px]">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody class="bg-slate-950/10">
+                    <tr
+                      v-for="(row, idx) in usbLogs"
+                      :key="idx"
+                      class="border-t border-white/5 hover:bg-white/5 transition-colors"
+                    >
+                      <td class="px-3 py-2 font-mono text-slate-300 whitespace-nowrap">
+                        {{ row.created_at || "-" }}
+                      </td>
+                      <td class="px-3 py-2">
+                        <span class="inline-flex items-center gap-2">
+                          <span
+                            class="w-2 h-2 rounded-full"
+                            :class="row.action === 'insert' ? 'bg-emerald-400' : 'bg-red-400'"
+                          ></span>
+                          <span
+                            class="text-xs font-semibold"
+                            :class="row.action === 'insert' ? 'text-emerald-200' : 'text-red-200'"
+                          >
+                            {{ row.action === "insert" ? "插入" : "拔出" }}
+                          </span>
+                        </span>
+                      </td>
+                      <td class="px-3 py-2 min-w-0">
+                        <div class="flex items-center justify-between gap-3">
+                          <div class="min-w-0">
+                            <div class="text-slate-100 font-semibold truncate">
+                              {{ parseUsbId(row.usb_id).vendor }}
+                            </div>
+                            <div class="text-[11px] text-slate-400 truncate" :title="parseUsbId(row.usb_id).short">
+                              {{ parseUsbId(row.usb_id).short }}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                      <td class="px-3 py-2 text-slate-300 break-all">
+                        {{ row.volume_name || "-" }}
+                      </td>
+                      <td class="px-3 py-2">
+                        <button
+                          class="text-[11px] w-full px-2 py-1 rounded border border-white/10 bg-slate-950/20 hover:bg-slate-950/40 text-slate-200 disabled:opacity-60"
+                          :disabled="usbPolicyLoading"
+                          @click="toggleAllowlist(selectedDeviceId, row.usb_id, !allowlistSet.has(normalizeUSBID(row.usb_id)))"
+                        >
+                          {{ allowlistSet.has(normalizeUSBID(row.usb_id)) ? "移出白名单" : "加入白名单" }}
+                        </button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Security Audit -->
       <div v-if="activeTab==='security'" class="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
         <template v-if="securityPanelLoading">
@@ -2222,7 +2760,7 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                 </thead>
                 <tbody class="bg-slate-900/30">
                   <tr
-                    v-for="(p, i) in securityListeningRowsCache"
+                    v-for="p in securityListeningRowsCache"
                     :key="p?.key || `${p?.pid || 0}-${p?.port || 0}`"
                     class="border-t border-slate-800/60"
                     :class="p?.riskLevel === 'CRITICAL' ? 'bg-red-500/10' : (p?.riskLevel === 'WARNING' ? 'bg-amber-500/10' : (p?.riskLevel === 'AUTHORIZED' ? 'bg-emerald-500/10' : ''))"

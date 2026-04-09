@@ -50,8 +50,7 @@ const selectedDeviceId = ref<string>("");
 const userSelected = ref(false);
 
 // Active device reference (required by detail pane)
-const activeId = selectedDeviceId;
-const activeDevice = computed(() => devices.value.find((d) => d.device_id === activeId.value));
+const _activeId = selectedDeviceId;
 
 const currentDevice = reactive<CurrentDevice>({
   deviceId: selectedDeviceId.value || "",
@@ -114,8 +113,9 @@ function normalizeArray(v: any): any[] {
     try {
       const parsed = JSON.parse(v);
       if (Array.isArray(parsed)) return parsed;
-    } catch {
-      // ignore
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(err);
     }
   }
   return [];
@@ -126,7 +126,9 @@ function normalizeObject(v: any): any | null {
   if (typeof v === "string") {
     try {
       return JSON.parse(v);
-    } catch {
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(err);
       return null;
     }
   }
@@ -203,6 +205,16 @@ const ws = useWebSocket((data: any, raw: any) => {
     data?.device_id ?? data?.deviceId ?? data?.DeviceID ?? currentDevice.deviceId;
   if (!incomingDeviceId) return;
 
+  // USB incremental signal: forward to components via DOM CustomEvent.
+  if (data?.type === "usb_update") {
+    try {
+      window.dispatchEvent(new CustomEvent("usb_update", { detail: { device_id: incomingDeviceId } }));
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(err);
+    }
+    return;
+  }
   // Register device id for the left panel so the user can switch.
   if (!devices.value.some((d) => d.device_id === incomingDeviceId)) {
     devices.value.push({ device_id: incomingDeviceId, hostname: "", os: "", updated_at: 0, online: false });
@@ -349,8 +361,9 @@ function connectGlobal() {
           // eslint-disable-next-line no-console
           console.log("Current devices in list:", devices.value.length);
         }
-      } catch {
-        // ignore
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(err);
       }
     };
     wsGlobal.onclose = () => {
@@ -359,10 +372,16 @@ function connectGlobal() {
       wsGlobal = null;
     };
     wsGlobal.onerror = () => {
-      try { wsGlobal?.close(); } catch {}
+      try {
+        wsGlobal?.close();
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(err);
+      }
     };
-  } catch {
-    // ignore
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
   }
 }
 
@@ -520,7 +539,12 @@ onUnmounted(() => {
     window.clearInterval(deviceOnlineTick);
     deviceOnlineTick = null;
   }
-  try { wsGlobal?.close(); } catch {}
+  try {
+    wsGlobal?.close();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+  }
   wsGlobal = null;
 });
 
@@ -539,7 +563,9 @@ onMounted(async () => {
       }
       return;
     }
-  } catch {
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
     // Ignore; fallback to the seed device.
   }
 
