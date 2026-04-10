@@ -86,3 +86,6 @@ config.secret.yml
 
 # Do not sync screenshots/images
 image/
+
+# Local one-off ops scripts
+onkey.txt

@@ -102,8 +102,8 @@ const swQuery = ref("");
 const swRiskOnly = ref(false);
 const activeTab = ref<"overview" | "network" | "hardware" | "compute" | "security" | "software" | "usb">("overview");
 
-// ---------------- USB 管控（Mock Contract） ----------------
-type USBPolicyMock = {
+// ---------------- USB 管控 ----------------
+type USBPolicyView = {
   disabled: boolean;
   allowlist: string[];
 };
@@ -113,6 +113,7 @@ type USBLogEntry = {
   action: "insert" | "remove";
   created_at: string; // ISO string
   volume_name?: string;
+  product_name?: string;
 };
 
 type ParsedUSBID = {
@@ -124,10 +125,6 @@ type ParsedUSBID = {
   displayTitle: string;
 };
 
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
-}
-
 function titleizeToken(raw: string): string {
   const s = String(raw || "").trim().replace(/[_\s]+/g, " ");
   if (!s) return "";
@@ -138,10 +135,15 @@ function titleizeToken(raw: string): string {
     .join(" ");
 }
 
-// parseUsbId must extract vendor from e.g. USBSTOR\DISK&VEN_VERBATIM&PROD_...
-function parseUsbId(id: string): ParsedUSBID {
+// parseUsbId extracts vendor/product from IDs like:
+// USBSTOR\DISK&VEN_VERBATIM&PROD_...
+// SCSI\DISK&VEN_SAMSUNG&PROD_...
+// When `storageHint` is set (agent STORAGE descriptor), prefer it for PHYSICALDRIVE\N and other non-VID rows.
+function parseUsbId(id: string, storageHint = ""): ParsedUSBID {
   const raw = String(id || "").trim();
   const upper = raw.toUpperCase();
+  const hint = String(storageHint || "").trim();
+  const looksPhysicalDrive = /^PHYSICALDRIVE\\/i.test(raw);
 
   const pickToken = (key: string) => {
     const idx = upper.indexOf(key);
@@ -151,9 +153,15 @@ function parseUsbId(id: string): ParsedUSBID {
     const token = raw.slice(start, end >= 0 ? end : raw.length);
     return token.trim();
   };
+  const pickTokenRegex = (pattern: RegExp) => {
+    const m = raw.match(pattern);
+    if (!m || !m[1]) return "";
+    return String(m[1]).trim();
+  };
 
-  const ven = pickToken("VEN_");
-  const prod = pickToken("PROD_");
+  // Compatible with USBSTOR\... and SCSI\DISK&VEN_...&PROD_... variants.
+  const ven = pickToken("VEN_") || pickTokenRegex(/[\\&]VEN[_-]([^&\\]+)/i);
+  const prod = pickToken("PROD_") || pickTokenRegex(/[\\&]PROD[_-]([^&\\]+)/i);
   const vid = pickToken("VID_");
   const pid = pickToken("PID_");
 
@@ -168,6 +176,18 @@ function parseUsbId(id: string): ParsedUSBID {
 
   const displayTitle = shortParts.length ? shortParts.slice(0, 2).join(" · ") : "Unknown USB";
   const short = shortParts.length ? shortParts.join(" · ") : shorten(raw, 36);
+
+  if (hint && (looksPhysicalDrive || (vendor === "Unknown" && !vid))) {
+    return {
+      vendor: hint,
+      product: "",
+      vid: vid.toUpperCase(),
+      pid: pid.toUpperCase(),
+      short: hint,
+      displayTitle: hint,
+    };
+  }
+
   return {
     vendor,
     product,
@@ -182,15 +202,50 @@ function normalizeUSBID(id: string): string {
   return String(id || "").trim().toUpperCase().replace(/\\+/g, "\\");
 }
 
-const usbPolicy = ref<USBPolicyMock>({ disabled: false, allowlist: [] });
+function isInternalStorageID(id: string): boolean {
+  const s = normalizeUSBID(id);
+  if (!s) return false;
+  return s.includes("NVME") || s.includes("SATA") || s.includes("RAID") || s.includes("AHCI");
+}
+
+/** USB audit logs are always shown in China standard time (+08), independent of VPN / browser default TZ. */
+const USB_AUDIT_TIME_ZONE = "Asia/Shanghai";
+
+/**
+ * Format audit `created_at` (ISO / RFC3339 from API) as MM-DD HH:mm:ss in Asia/Shanghai.
+ * Uses Intl with explicit timeZone — never string slice on the raw value.
+ */
+function formatUsbAuditTime(raw: string): string {
+  const s = String(raw || "").trim();
+  if (!s) return "-";
+  const t = Date.parse(s);
+  const d = Number.isNaN(t) ? new Date(s) : new Date(t);
+  if (Number.isNaN(d.getTime())) return s;
+  // Browser/OS TZ (unchanged under many VPN setups); table still uses USB_AUDIT_TIME_ZONE only.
+  void Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: USB_AUDIT_TIME_ZONE,
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(d);
+  const pick = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${pick("month")}-${pick("day")} ${pick("hour")}:${pick("minute")}:${pick("second")}`;
+}
+
+const usbPolicy = ref<USBPolicyView>({ disabled: false, allowlist: [] });
 const usbPolicyLoading = ref(false);
 const usbPolicyError = ref<string | null>(null);
+const usbPolicyHint = ref<string>("");
+let usbPolicyHintTimer: number | null = null;
 
 const usbLogs = ref<USBLogEntry[]>([]);
 const usbLogsLoading = ref(false);
 const usbLogsError = ref<string | null>(null);
-
-const usbMockSeededForDevice = ref<string>("");
+const usbRefreshing = ref(false);
 
 const allowlistSet = computed(() => new Set((usbPolicy.value?.allowlist ?? []).map((x) => normalizeUSBID(x))));
 
@@ -202,23 +257,36 @@ const usbStatusText = computed(() => {
 
 const usbPolicySwitchChecked = computed(() => !usbPolicy.value.disabled);
 
+function showUSBPolicyHint(msg: string) {
+  usbPolicyHint.value = msg;
+  if (usbPolicyHintTimer != null) {
+    window.clearTimeout(usbPolicyHintTimer);
+  }
+  usbPolicyHintTimer = window.setTimeout(() => {
+    usbPolicyHint.value = "";
+    usbPolicyHintTimer = null;
+  }, 3500);
+}
+
 async function fetchUSBPolicy(deviceId: string) {
   if (!deviceId) return;
   usbPolicyLoading.value = true;
   usbPolicyError.value = null;
   try {
-    // eslint-disable-next-line no-console
-    console.log("[MOCK] fetchUSBPolicy", { deviceId });
-    await sleep(180);
-    const resp: USBPolicyMock = {
-      disabled: !!usbPolicy.value?.disabled,
-      allowlist: Array.isArray(usbPolicy.value?.allowlist) ? [...usbPolicy.value.allowlist] : [],
+    const { data } = await request.get(`/api/v1/device/${encodeURIComponent(deviceId)}/usb_policy`, {
+      params: { t: Date.now() },
+    });
+    const allowRaw = data?.allowlist ?? data?.allowed_instance_ids ?? [];
+    const allowlist = Array.isArray(allowRaw) ? allowRaw.map((x: any) => normalizeUSBID(String(x || ""))).filter(Boolean) : [];
+    usbPolicy.value = {
+      disabled: !!data?.disabled,
+      allowlist,
     };
-    usbPolicy.value = resp;
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(err);
     usbPolicyError.value = "failed";
+    showUSBPolicyHint("策略同步失败，请检查后端权限");
   } finally {
     usbPolicyLoading.value = false;
   }
@@ -229,10 +297,10 @@ async function toggleUSBPolicy(deviceId: string, nextDisabled: boolean) {
   usbPolicyLoading.value = true;
   usbPolicyError.value = null;
   try {
-    // eslint-disable-next-line no-console
-    console.log("[MOCK] toggleUSBPolicy POST", { deviceId, disabled: nextDisabled });
-    await sleep(220);
-    usbPolicy.value = { ...usbPolicy.value, disabled: nextDisabled };
+    await request.post(`/api/v1/device/${encodeURIComponent(deviceId)}/usb_policy`, {
+      disabled: nextDisabled,
+    });
+    await refreshUSBAll(deviceId);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(err);
@@ -247,53 +315,30 @@ async function fetchUSBLogs(deviceId: string) {
   usbLogsLoading.value = true;
   usbLogsError.value = null;
   try {
-    // eslint-disable-next-line no-console
-    console.log("[MOCK] fetchUSBLogs", { deviceId });
-    await sleep(220);
-
-    // One-time seed so the UI isn't empty during integration (remove when wiring real API).
-    if (!usbMockSeededForDevice.value || usbMockSeededForDevice.value !== deviceId) {
-      usbMockSeededForDevice.value = deviceId;
-      const now = Date.now();
-      const iso = (t: number) => new Date(t).toISOString();
-      usbLogs.value = [
-        {
-          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
-          action: "insert",
-          created_at: iso(now - 2 * 60 * 1000),
-          volume_name: "E: [VERBATIM]",
-        },
-        {
-          usb_id: `USBSTOR\\DISK&VEN_SAN_DISK&PROD_ULTRA&REV_1.00\\ABCDEF012345&0`,
-          action: "insert",
-          created_at: iso(now - 8 * 60 * 1000),
-          volume_name: "F: [SANDISK]",
-        },
-        {
-          usb_id: `USBSTOR\\DISK&VEN_SAN_DISK&PROD_ULTRA&REV_1.00\\ABCDEF012345&0`,
-          action: "remove",
-          created_at: iso(now - 12 * 60 * 1000),
-          volume_name: "F: [SANDISK]",
-        },
-        {
-          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
-          action: "remove",
-          created_at: iso(now - 30 * 60 * 1000),
-          volume_name: "E: [VERBATIM]",
-        },
-        {
-          usb_id: `USBSTOR\\DISK&VEN_VERBATIM&PROD_STORE_N_GO&REV_1.00\\001122334455&0`,
-          action: "insert",
-          created_at: iso(now - 55 * 60 * 1000),
-          volume_name: "E: [VERBATIM]",
-        },
-      ];
-      // eslint-disable-next-line no-console
-      console.log("[MOCK] seeded usb_logs", { deviceId, count: usbLogs.value.length });
+    const { data } = await request.get(`/api/v1/device/${encodeURIComponent(deviceId)}/usb_logs`, {
+      params: { limit: 50, t: Date.now() },
+    });
+    const rawItems = Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : [];
+    const nextItems: USBLogEntry[] = rawItems.map((it: any) => ({
+      usb_id: String(it?.usb_id || ""),
+      action: String(it?.action || "").toLowerCase() === "remove" ? "remove" : "insert",
+      created_at: String(it?.created_at || ""),
+      volume_name: String(it?.volume_name || ""),
+      product_name: String(it?.product_name || ""),
+    })).filter((it: USBLogEntry) => !!it.usb_id);
+    // Incremental merge: keep existing rows and merge in fresh rows by stable key.
+    const mergedMap = new Map<string, USBLogEntry>();
+    const makeKey = (it: USBLogEntry) =>
+      `${normalizeUSBID(it.usb_id)}|${it.action}|${it.created_at}|${it.volume_name || ""}|${it.product_name || ""}`;
+    for (const row of usbLogs.value) {
+      mergedMap.set(makeKey(row), row);
     }
-
-    const items: USBLogEntry[] = Array.isArray(usbLogs.value) ? usbLogs.value : [];
-    usbLogs.value = items;
+    for (const row of nextItems) {
+      mergedMap.set(makeKey(row), row);
+    }
+    const merged = Array.from(mergedMap.values());
+    merged.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    usbLogs.value = merged;
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(err);
@@ -306,22 +351,16 @@ async function fetchUSBLogs(deviceId: string) {
 
 async function toggleAllowlist(deviceId: string, usbId: string, nextInAllowlist: boolean) {
   if (!deviceId) return;
-  const norm = normalizeUSBID(usbId);
   usbPolicyLoading.value = true;
   usbPolicyError.value = null;
   try {
-    // eslint-disable-next-line no-console
-    console.log("[MOCK] toggleAllowlist", {
-      method: nextInAllowlist ? "POST" : "DELETE",
-      deviceId,
-      usb_id: usbId,
-    });
-    await sleep(200);
-    const cur = Array.isArray(usbPolicy.value.allowlist) ? usbPolicy.value.allowlist : [];
-    const curSet = new Set(cur.map((x) => normalizeUSBID(x)));
-    if (nextInAllowlist) curSet.add(norm);
-    else curSet.delete(norm);
-    usbPolicy.value = { ...usbPolicy.value, allowlist: Array.from(curSet) };
+    const url = `/api/v1/device/${encodeURIComponent(deviceId)}/usb_allowlist`;
+    if (nextInAllowlist) {
+      await request.post(url, { usb_id: usbId });
+    } else {
+      await request.delete(url, { data: { usb_id: usbId } });
+    }
+    await refreshUSBAll(deviceId);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(err);
@@ -333,7 +372,15 @@ async function toggleAllowlist(deviceId: string, usbId: string, nextInAllowlist:
 
 async function refreshUSBAll(deviceId: string) {
   if (!deviceId) return;
-  await Promise.all([fetchUSBPolicy(deviceId), fetchUSBLogs(deviceId)]);
+  usbRefreshing.value = true;
+  // Force-rebuild safety: clear temporary inferred-device list before recompute.
+  usbDevices.value = [];
+  try {
+    await Promise.all([fetchUSBPolicy(deviceId), fetchUSBLogs(deviceId)]);
+    rebuildUSBDevicesFromLogs();
+  } finally {
+    usbRefreshing.value = false;
+  }
 }
 
 type USBOnlineDevice = {
@@ -341,47 +388,138 @@ type USBOnlineDevice = {
   vendorTitle: string;
   shortTitle: string;
   volume_name: string;
+  volume_name_full: string;
   last_insert_at: string;
   in_allowlist: boolean;
 };
 
-const usbOnlineDevices = computed<USBOnlineDevice[]>(() => {
-  const logs = Array.isArray(usbLogs.value) ? usbLogs.value : [];
-  if (!logs.length) return [];
+const usbDevices = ref<USBOnlineDevice[]>([]);
 
-  // For each usb_id, find the latest event (by created_at lexicographic ISO, fallback by array order).
-  const lastByID = new Map<string, USBLogEntry>();
-  for (const e of logs) {
-    const id = normalizeUSBID(e?.usb_id || "");
-    if (!id) continue;
-    const prev = lastByID.get(id);
-    if (!prev) {
-      lastByID.set(id, e);
+function sanitizeVolumeName(rawVolume: string): { primary: string; full: string } {
+  const full = String(rawVolume || "").trim();
+  if (!full) return { primary: "未知卷标", full: "" };
+  const commaCount = (full.match(/,/g) || []).length;
+  // Backend may return snapshot-like merged labels: "GHO, M:".
+  const tokens = full.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!tokens.length) return { primary: "未知卷标", full: full };
+  // Emergency guard: if too many merged fragments exist, only keep first token.
+  if (commaCount > 2) {
+    return {
+      primary: tokens[0] || "未知卷标",
+      full: tokens[0] || "未知卷标",
+    };
+  }
+  return {
+    primary: tokens[0] || "未知卷标",
+    full,
+  };
+}
+
+function extractVolumeCandidates(rawVolume: string): string[] {
+  return String(rawVolume || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function pickBestVolumeForID(
+  usbID: string,
+  candidates: string[],
+  idPreferredVolume: Map<string, string>,
+  volumeOwner: Map<string, string>
+): string {
+  if (!candidates.length) return "";
+  const preferred = idPreferredVolume.get(usbID) || "";
+  if (preferred && candidates.includes(preferred)) return preferred;
+  for (const c of candidates) {
+    const owner = volumeOwner.get(c);
+    if (!owner || owner === usbID) return c;
+  }
+  return candidates[0] || "";
+}
+
+function rebuildUSBDevicesFromLogs() {
+  // Explicit reset first so Vue UI always receives a fresh reference.
+  usbDevices.value = [];
+  const logs = Array.isArray(usbLogs.value) ? usbLogs.value : [];
+  // eslint-disable-next-line no-console
+  console.log("Current Logs:", logs);
+  if (!logs.length) {
+    // eslint-disable-next-line no-console
+    console.log("Calculated Active Devices:", usbDevices.value);
+    return;
+  }
+
+  // Strict Map<usb_id, DeviceInfo> state machine, processed in chronological order.
+  const sorted = [...logs].sort((a, b) => String(a?.created_at || "").localeCompare(String(b?.created_at || "")));
+  const deviceMap = new Map<string, USBOnlineDevice>();
+  const activeDevices = new Set<string>();
+  const idPreferredVolume = new Map<string, string>();
+  const volumeOwner = new Map<string, string>();
+
+  for (const row of sorted) {
+    const normID = normalizeUSBID(row?.usb_id || "");
+    if (!normID) continue;
+    if (isInternalStorageID(normID)) continue;
+    const action = String(row?.action || "").toLowerCase() === "remove" ? "remove" : "insert";
+    const at = String(row?.created_at || "").trim();
+    let volumeRaw = String(row?.volume_name || "").trim();
+    // Dirty-data guard: comma-joined drive lists should never reach the UI whole.
+    if ((volumeRaw.match(/,/g) || []).length > 2) {
+      volumeRaw = String(volumeRaw.split(",")[0] || "").trim();
+    }
+    // eslint-disable-next-line no-console
+    console.log(`Processing ID: ${normID}, Volume: ${volumeRaw}`);
+
+    if (action === "insert") {
+      const parsed = parseUsbId(normID, row.product_name || "");
+      const prev = deviceMap.get(normID);
+      const candidates = extractVolumeCandidates(volumeRaw);
+      const chosen = pickBestVolumeForID(normID, candidates, idPreferredVolume, volumeOwner);
+      if (chosen) {
+        idPreferredVolume.set(normID, chosen);
+        volumeOwner.set(chosen, normID);
+      }
+      // Strict `=` assignment per log row only (never += / string accumulation).
+      let nextVolumeName = "";
+      let nextVolumeNameFull = "";
+      if (volumeRaw) {
+        nextVolumeName = chosen || String(volumeRaw.split(",")[0] || "").trim() || "未知卷标";
+        nextVolumeNameFull = volumeRaw;
+      } else if (prev) {
+        nextVolumeName = prev.volume_name;
+        nextVolumeNameFull = prev.volume_name_full;
+      } else {
+        nextVolumeName = "未知卷标";
+        nextVolumeNameFull = "";
+      }
+      deviceMap.set(normID, {
+        usb_id: normID,
+        vendorTitle: parsed.vendor || "Unknown",
+        shortTitle: parsed.displayTitle || parsed.short,
+        volume_name: nextVolumeName,
+        volume_name_full: nextVolumeNameFull,
+        last_insert_at: at,
+        in_allowlist: allowlistSet.value.has(normID),
+      });
+      activeDevices.add(normID);
       continue;
     }
-    const a = String(prev.created_at || "");
-    const b = String(e.created_at || "");
-    if (b && a) {
-      if (b > a) lastByID.set(id, e);
-    } else {
-      lastByID.set(id, e);
+
+    // remove: device must disappear from active set immediately
+    const owned = idPreferredVolume.get(normID);
+    if (owned) {
+      volumeOwner.delete(owned);
     }
+    activeDevices.delete(normID);
   }
 
   const out: USBOnlineDevice[] = [];
-  for (const [normID, last] of lastByID.entries()) {
-    const action = String(last?.action || "").toLowerCase();
-    if (action !== "insert") continue; // online inference: last action insert
-    const parsed = parseUsbId(normID);
-    const inAllow = allowlistSet.value.has(normID);
-    out.push({
-      usb_id: normID,
-      vendorTitle: parsed.vendor || "Unknown",
-      shortTitle: parsed.displayTitle || parsed.short,
-      volume_name: String(last?.volume_name || "").trim(),
-      last_insert_at: String(last?.created_at || "").trim(),
-      in_allowlist: inAllow,
-    });
+  for (const id of activeDevices.values()) {
+    const info = deviceMap.get(id);
+    if (!info) continue;
+    // refresh allowlist flag from latest policy view
+    out.push({ ...info, in_allowlist: allowlistSet.value.has(id) });
   }
 
   // Stable sort: allowlisted first, then by last_insert_at desc.
@@ -389,10 +527,78 @@ const usbOnlineDevices = computed<USBOnlineDevice[]>(() => {
     if (a.in_allowlist !== b.in_allowlist) return a.in_allowlist ? -1 : 1;
     return String(b.last_insert_at || "").localeCompare(String(a.last_insert_at || ""));
   });
-  return out;
+  // Final defensive unique pass by usb_id.
+  const uniq = new Map<string, USBOnlineDevice>();
+  for (const it of out) {
+    uniq.set(normalizeUSBID(it.usb_id), it);
+  }
+  usbDevices.value = Array.from(uniq.values());
+  // eslint-disable-next-line no-console
+  console.log("Calculated Active Devices:", usbDevices.value);
+}
+
+watch(
+  () => [usbLogs.value, usbPolicy.value.allowlist],
+  () => {
+    rebuildUSBDevicesFromLogs();
+  },
+  { deep: true }
+);
+
+const usbOnlineCount = computed(() => usbDevices.value.length);
+const usbLogsVisible = computed(() => (usbLogs.value || []).filter((r) => !isInternalStorageID(r?.usb_id || "")));
+
+const usbVolumeHintByID = computed(() => {
+  const m = new Map<string, string>();
+  for (const d of usbDevices.value) {
+    m.set(normalizeUSBID(d.usb_id), d.volume_name || "");
+  }
+  return m;
 });
 
-const usbOnlineCount = computed(() => usbOnlineDevices.value.length);
+const usbLastInsertVolumeByID = computed(() => {
+  const m = new Map<string, string>();
+  const sorted = [...(usbLogs.value || [])].sort((a, b) => String(a?.created_at || "").localeCompare(String(b?.created_at || "")));
+  for (const row of sorted) {
+    const id = normalizeUSBID(row?.usb_id || "");
+    if (!id) continue;
+    const action = String(row?.action || "").toLowerCase() === "remove" ? "remove" : "insert";
+    if (action !== "insert") continue;
+    const raw = String(row?.volume_name || "").trim();
+    if (!raw) continue;
+    const cands = extractVolumeCandidates(raw);
+    if (!cands.length) continue;
+    m.set(id, cands[0]);
+  }
+  return m;
+});
+
+function displayVolumeForLogRow(row: USBLogEntry): { short: string; full: string } {
+  const full = String(row?.volume_name || "").trim();
+  const id = normalizeUSBID(row?.usb_id || "");
+  const action = String(row?.action || "").toLowerCase() === "remove" ? "remove" : "insert";
+  const commaCount = (full.match(/,/g) || []).length;
+
+  // Remove rows may carry dirty mixed snapshot labels from backend; prefer historical insert label.
+  if (action === "remove") {
+    const stable = usbLastInsertVolumeByID.value.get(id) || "";
+    if (stable) return { short: stable, full: stable };
+    return { short: "-", full: full || "" };
+  }
+
+  if (!full) return { short: "未知卷标", full: "" };
+  const candidates = extractVolumeCandidates(full);
+  if (!candidates.length) return { short: "未知卷标", full };
+  if (commaCount > 2) {
+    const first = candidates[0] || "未知卷标";
+    return { short: first, full: first };
+  }
+  const hint = usbVolumeHintByID.value.get(id) || "";
+  if (hint && candidates.includes(hint)) {
+    return { short: hint, full };
+  }
+  return { short: candidates[0], full };
+}
 
 const VULNERABILITY_RULES: Array<{ name: string; version_lt?: string; version_eq?: string }> = [
   { name: "OpenSSL", version_lt: "3.0.7" },
@@ -720,7 +926,6 @@ watch(
     usbLogs.value = [];
     usbLogsLoading.value = false;
     usbLogsError.value = null;
-    usbMockSeededForDevice.value = "";
 
     const nextId = selectedDeviceId.value;
     if (nextId) {
@@ -1479,6 +1684,10 @@ onUnmounted(() => {
   window.clearInterval(heartbeatTimer);
   window.removeEventListener("click", closeSecurityContextMenu, true);
   window.removeEventListener("usb_update", handleUSBUpdateEvent as EventListener);
+  if (usbPolicyHintTimer != null) {
+    window.clearTimeout(usbPolicyHintTimer);
+    usbPolicyHintTimer = null;
+  }
 });
 
 const lastHeartbeatAgoText = computed(() => {
@@ -2516,7 +2725,7 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                 <div class="min-w-0">
                   <div class="text-sm font-semibold text-slate-100">USB 策略</div>
                   <div class="text-[11px] text-slate-400 mt-1">
-                    Mock Contract：点击开关触发 `toggleUSBPolicy()`，收到 `usb_update` 时会全量刷新（策略 + 日志）。
+                    点击开关触发策略接口，收到 `usb_update` 时会全量刷新（策略 + 日志）。
                   </div>
                 </div>
                 <button
@@ -2546,6 +2755,12 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                   <span v-else>Allowlist {{ usbPolicy.allowlist.length }} 项</span>
                 </div>
               </div>
+              <div
+                v-if="usbPolicyHint"
+                class="mt-2 text-[11px] px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200"
+              >
+                {{ usbPolicyHint }}
+              </div>
             </div>
 
             <!-- Online devices header -->
@@ -2562,7 +2777,7 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
             <!-- Online device cards -->
             <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-1 gap-3">
               <div
-                v-for="d in usbOnlineDevices"
+                v-for="d in usbDevices"
                 :key="d.usb_id"
                 class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-4"
               >
@@ -2586,11 +2801,13 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                 <div class="mt-3 grid grid-cols-2 gap-2 text-[11px]">
                   <div class="text-slate-400">
                     <div class="text-slate-500">卷标/盘符</div>
-                    <div class="text-slate-200 truncate" :title="d.volume_name || '-'">{{ d.volume_name || "-" }}</div>
+                    <div class="text-slate-200 truncate" :title="d.volume_name_full || d.volume_name || '-'">{{ d.volume_name || "-" }}</div>
                   </div>
                   <div class="text-slate-400">
                     <div class="text-slate-500">最后插入</div>
-                    <div class="text-slate-200 font-mono truncate" :title="d.last_insert_at || '-'">{{ d.last_insert_at || "-" }}</div>
+                    <div class="text-slate-200 font-mono truncate" :title="d.last_insert_at || ''">
+                      {{ formatUsbAuditTime(d.last_insert_at) }}
+                    </div>
                   </div>
                 </div>
 
@@ -2609,7 +2826,7 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
               </div>
 
               <div
-                v-if="!usbLogsLoading && usbOnlineDevices.length === 0"
+                v-if="!usbLogsLoading && usbDevices.length === 0"
                 class="rounded-xl bg-white/5 backdrop-blur-xl border border-white/10 p-6 text-center text-sm text-slate-400"
               >
                 暂无在线 USB 设备（等待插入事件或日志同步）
@@ -2633,16 +2850,19 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                 <div class="flex items-center gap-2">
                   <button
                     class="text-[11px] px-3 py-1.5 rounded border border-white/10 bg-slate-950/20 hover:bg-slate-950/40 text-slate-200 disabled:opacity-60"
-                    :disabled="usbLogsLoading || usbPolicyLoading"
+                    :disabled="usbRefreshing || usbLogsLoading || usbPolicyLoading"
                     @click="refreshUSBAll(selectedDeviceId)"
                     title="全量刷新策略 + 日志"
                   >
-                    {{ usbLogsLoading || usbPolicyLoading ? "刷新中..." : "刷新" }}
+                    <span class="inline-flex items-center gap-1.5">
+                      <span v-if="usbRefreshing" class="w-3 h-3 border-2 border-slate-300/80 border-t-transparent rounded-full animate-spin"></span>
+                      <span>{{ usbRefreshing || usbLogsLoading || usbPolicyLoading ? "刷新中..." : "刷新" }}</span>
+                    </span>
                   </button>
                   <div class="text-[11px] text-slate-400">
                     <span v-if="usbLogsLoading">加载中</span>
                     <span v-else-if="usbLogsError" class="text-red-300">加载失败</span>
-                    <span v-else>{{ usbLogs.length }} 条</span>
+                    <span v-else>{{ usbLogsVisible.length }} 条</span>
                   </div>
                 </div>
               </div>
@@ -2650,7 +2870,7 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
               <div v-if="usbLogsLoading" class="h-64 flex items-center justify-center text-sm text-slate-400">
                 正在加载 USB 日志...
               </div>
-              <div v-else-if="usbLogs.length === 0" class="h-64 flex items-center justify-center text-sm text-slate-400">
+              <div v-else-if="usbLogsVisible.length === 0" class="h-64 flex items-center justify-center text-sm text-slate-400">
                 暂无 USB 审计记录
               </div>
               <div v-else class="panel-table-60 scroll-area scroll-dark">
@@ -2666,12 +2886,12 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                   </thead>
                   <tbody class="bg-slate-950/10">
                     <tr
-                      v-for="(row, idx) in usbLogs"
+                      v-for="(row, idx) in usbLogsVisible"
                       :key="idx"
                       class="border-t border-white/5 hover:bg-white/5 transition-colors"
                     >
-                      <td class="px-3 py-2 font-mono text-slate-300 whitespace-nowrap">
-                        {{ row.created_at || "-" }}
+                      <td class="px-3 py-2 font-mono text-slate-300 whitespace-nowrap" :title="row.created_at || ''">
+                        {{ formatUsbAuditTime(row.created_at) }}
                       </td>
                       <td class="px-3 py-2">
                         <span class="inline-flex items-center gap-2">
@@ -2691,16 +2911,16 @@ const alertSummaryItems = computed<AlertItem[]>(() => {
                         <div class="flex items-center justify-between gap-3">
                           <div class="min-w-0">
                             <div class="text-slate-100 font-semibold truncate">
-                              {{ parseUsbId(row.usb_id).vendor }}
+                              {{ parseUsbId(row.usb_id, row.product_name || "").vendor }}
                             </div>
-                            <div class="text-[11px] text-slate-400 truncate" :title="parseUsbId(row.usb_id).short">
-                              {{ parseUsbId(row.usb_id).short }}
+                            <div class="text-[11px] text-slate-400 truncate" :title="parseUsbId(row.usb_id, row.product_name || '').short">
+                              {{ parseUsbId(row.usb_id, row.product_name || "").short }}
                             </div>
                           </div>
                         </div>
                       </td>
-                      <td class="px-3 py-2 text-slate-300 break-all">
-                        {{ row.volume_name || "-" }}
+                      <td class="px-3 py-2 text-slate-300 break-all" :title="displayVolumeForLogRow(row).full || '-'">
+                        {{ displayVolumeForLogRow(row).short || "-" }}
                       </td>
                       <td class="px-3 py-2">
                         <button

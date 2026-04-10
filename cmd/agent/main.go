@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -23,6 +24,18 @@ import (
 	kservice "github.com/kardianos/service"
 )
 
+func hasFlagArg(args []string, longName string) bool {
+	want := "-" + strings.TrimSpace(longName)
+	want2 := "--" + strings.TrimSpace(longName)
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimSpace(args[i])
+		if a == want || a == want2 || strings.HasPrefix(a, want+"=") || strings.HasPrefix(a, want2+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 // Build-time version info. Override via:
 //
 //	go build -ldflags "-X 'github.com/qinyilin/go-agent/cmd/agent.Version=1.2.3' ..."
@@ -33,13 +46,25 @@ var (
 )
 
 func main() {
+	// Auto runtime args: allow launching exe directly without manual data/log flags.
+	// Users can still override by explicitly passing flags.
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		if !hasFlagArg(os.Args[1:], "data-dir") {
+			os.Args = append(os.Args, "-data-dir", exeDir)
+		}
+	}
+	if !hasFlagArg(os.Args[1:], "log-level") && !hasFlagArg(os.Args[1:], "debug") {
+		os.Args = append(os.Args, "-log-level", "debug")
+	}
+
 	var (
 		debug              = flag.Bool("debug", false, "run agent in debug mode (foreground) and stop on Ctrl+C")
 		agentVersion       = flag.String("version", Version, "agent runtime version reported in metrics and used for auto-update compare")
 		logLevel           = flag.String("log-level", "info", "log level: debug|info|warn|error")
 		collectEvery       = flag.Duration("collect-every", 2*time.Second, "interval for simulated device collection")
 		stopTimeout        = flag.Duration("stop-timeout", 10*time.Second, "timeout waiting for graceful stop")
-		dataDir            = flag.String("data-dir", "./data", "data directory for cache persistence")
+		dataDir            = flag.String("data-dir", "", "data directory for cache persistence (default: executable directory)")
 		apiURL             = flag.String("api-url", "http://192.168.8.168:8080/ingest", "backend ingest URL")
 		caCertPath         = flag.String("ca-cert", "./certs/ca.pem", "CA root certificate path (PEM)")
 		clientCert         = flag.String("client-cert", "./certs/client.pem", "client certificate path (PEM)")
@@ -55,13 +80,33 @@ func main() {
 	)
 	flag.Parse()
 
+	// Default data directory to executable directory so running from any cwd is stable.
+	if strings.TrimSpace(*dataDir) == "" {
+		if exePath, err := os.Executable(); err == nil {
+			*dataDir = filepath.Dir(exePath)
+		} else {
+			// Fallback to current directory when executable path is unavailable.
+			*dataDir = "."
+		}
+	}
+
 	// `-debug` is intended to enable debug logging during troubleshooting.
 	// If user didn't explicitly set `--log-level`, switch it to `debug`.
 	if *debug && strings.EqualFold(strings.TrimSpace(*logLevel), "info") {
 		*logLevel = "debug"
 	}
 
-	logger := internalservice.NewLogger(*logLevel)
+	logDir := filepath.Join(*dataDir, "logs")
+	logger, closeLogger, err := internalservice.NewLogger(*logLevel, logDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if closeLogger != nil {
+			_ = closeLogger()
+		}
+	}()
 
 	if strings.TrimSpace(*agentVersion) == "" {
 		*agentVersion = Version
@@ -72,8 +117,15 @@ func main() {
 		"gitCommit", GitCommit,
 		"dataDir", *dataDir,
 	)
+	logger.Debug("debug logging is active", "logLevel", strings.TrimSpace(*logLevel), "debugFlag", *debug)
+	logger.Info("effective log level", "logLevel", strings.TrimSpace(*logLevel), "debugFlag", *debug)
 
-	dbPath := filepath.Join(*dataDir, "agent_cache.db")
+	dbDir := filepath.Join(*dataDir, "db")
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create db dir: %v\n", err)
+		os.Exit(1)
+	}
+	dbPath := filepath.Join(dbDir, "agent_cache.db")
 	cache, err := buffer.NewDataBuffer(dbPath)
 	if err != nil {
 		logger.Error("failed to create data buffer", "err", err, "dbPath", dbPath)
@@ -175,16 +227,18 @@ func main() {
 
 	// USB monitor: run asynchronously and push events immediately via dispatcher.
 	{
+		logger.Debug("[USBDBG] usb monitor engine starting")
 		// Configure runtime policy fetcher for fine-grained allowlist.
 		internalservice.ConfigureUSBPolicyFetcher(*apiURL, controlDeviceID)
-		// Suppress event bursts: same host device + same action within a short window only processed once.
-		const usbEventSuppressWindow = 5 * time.Second
+		// Suppress duplicate bursts very lightly; keep near-realtime insert/remove visibility.
+		const usbEventSuppressWindow = 500 * time.Millisecond
 		var usbSupMu sync.Mutex
 		lastUSBProcessed := make(map[string]time.Time, 16)
 
 		usbCtx, cancel := context.WithCancel(context.Background())
 		_ = cancel // attached to service lifecycle via wrapper; keep for future wiring if needed
-		_ = internalservice.StartUSBMonitor(usbCtx, logger, 0, func(e models.USBEvent) {
+		// Use a short poll interval so remove events are reflected quickly in usb_logs/UI.
+		if err := internalservice.StartUSBMonitor(usbCtx, logger, 2*time.Second, func(e models.USBEvent) {
 			// Fill host id for audit ownership.
 			e.DeviceID = strings.TrimSpace(controlDeviceID)
 			if e.DeviceID == "" {
@@ -213,19 +267,59 @@ func main() {
 			}
 			lastUSBProcessed[key] = now
 			usbSupMu.Unlock()
+			logger.Debug("[USBDBG] usb event captured",
+				"device_id", e.DeviceID,
+				"action", e.Action,
+				"usb_id", e.USBID,
+				"volume_name", e.VolumeName,
+				"timestamp", e.Timestamp,
+			)
 
 			payload, err := json.Marshal(e)
 			if err != nil {
 				logger.Warn("marshal usb event failed", "err", err)
 				return
 			}
+			// Realtime fast path: post USB event immediately to backend report endpoint.
+			// Keep local cache path as fallback to tolerate transient network failures.
+			func() {
+				reqBody, merr := json.Marshal(map[string]any{
+					"device_id":   e.DeviceID,
+					"usb_events":  []models.USBEvent{e},
+					"reported_at": time.Now().Unix(),
+				})
+				if merr != nil {
+					logger.Warn("marshal usb direct report failed", "err", merr)
+					return
+				}
+				cctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				defer cancel()
+				status, _, perr := httpClient.PostJSON(cctx, reqBody)
+				if perr != nil || status < 200 || status >= 300 {
+					if perr != nil {
+						logger.Warn("usb direct report failed, fallback to cache", "err", perr)
+					} else {
+						logger.Warn("usb direct report rejected, fallback to cache", "status", status)
+					}
+					return
+				}
+				logger.Debug("[USBDBG] usb direct report sent", "device_id", e.DeviceID, "usb_id", e.USBID, "action", e.Action, "status", status)
+				// Direct post succeeded; no need to duplicate through cache.
+				payload = nil
+			}()
+			if payload == nil {
+				return
+			}
 			if err := cache.Save("usb_event", payload); err != nil {
 				logger.Warn("cache usb event failed", "err", err)
 				return
 			}
+			logger.Debug("[USBDBG] usb event cached for dispatcher", "device_id", e.DeviceID, "usb_id", e.USBID, "action", e.Action)
 			// Attempt immediate dispatch
 			dispatcher.DispatchNow(context.Background())
-		})
+		}); err != nil {
+			logger.Error("usb monitor engine failed to start", "err", err)
+		}
 	}
 
 	if runForeground {

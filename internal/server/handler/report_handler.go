@@ -376,6 +376,7 @@ func (h *ReportHandler) handleOldDirect(ctx context.Context, req model.ReportReq
 				HostDeviceID: hostID,
 				USBID:        strings.TrimSpace(e.USBID),
 				VolumeName:   strings.TrimSpace(e.VolumeName),
+				ProductName:  strings.TrimSpace(e.ProductName),
 				Action:       action,
 				CreatedAt:    at,
 			})
@@ -488,6 +489,7 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 				usbID = strings.TrimSpace(getStringAny(firstNonNil(obj["device_id"], obj["DeviceID"])))
 			}
 			volumeName := strings.TrimSpace(getStringAny(firstNonNil(obj["volume_name"], obj["VolumeName"])))
+			productName := strings.TrimSpace(getStringAny(firstNonNil(obj["product_name"], obj["ProductName"])))
 			action := strings.ToLower(strings.TrimSpace(getStringAny(firstNonNil(obj["action"], obj["Action"]))))
 			originalAction := action
 			// Treat initial-state "existing" as "insert" so the frontend can reflect current USB usage.
@@ -514,6 +516,7 @@ func (h *ReportHandler) handleBatch(ctx context.Context, batch ingestBatchReques
 				HostDeviceID: fp,
 				USBID:        usbID,
 				VolumeName:   volumeName,
+				ProductName:  productName,
 				Action:       action,
 				CreatedAt:    time.Unix(ts, 0),
 			})
